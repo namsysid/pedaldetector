@@ -14,7 +14,7 @@ buffer_duration = 1.5
 buffer_samples = int(buffer_duration * fs)
 rms_window_duration = 0.2
 rms_window_samples = int(rms_window_duration * fs)
-rms_threshold = 0.002
+rms_threshold = 0.01
 onset_cooldown_sec = 0.5
 onset_slice_duration = 0.5
 
@@ -30,26 +30,54 @@ last_onset_rms = 1e-6
 last_onset_time = 0
 circles = []
 
+# === LOG-LINEAR DECAY MODEL (from fitted values) ===
+A, B = 39.77, -41.52  # From digitized Figure 8
+
 # === INIT PYGAME ===
 pygame.init()
 screen = pygame.display.set_mode((WIDTH, HEIGHT))
-pygame.display.set_caption("Blurriness Visualizer")
+pygame.display.set_caption("Frequency-Aware Blurriness Visualizer")
 clock = pygame.time.Clock()
-background_color = np.array([255, 255, 255], dtype=np.float32)  # start white
+background_color = np.array([255, 255, 255], dtype=np.float32)
+
+# === HELPER FUNCTIONS ===
+def midi_to_freq(midi_note):
+    return 440.0 * (2 ** ((midi_note - 69) / 12))
+
+def estimate_pitch(signal, sr):
+    f0 = librosa.yin(signal, fmin=30, fmax=2000, sr=sr)
+    valid_f0 = f0[f0 > 0]
+    return float(np.median(valid_f0)) if len(valid_f0) > 0 else 440.0
+
+def compute_rms(signal):
+    return np.sqrt(np.mean(signal ** 2)) if len(signal) > 0 else 0.0
+
+def decay_multiplier_from_frequency(freq, frame_dt):
+    decay_rate = A + B * np.log10(freq)
+    return 10 ** (decay_rate * frame_dt / 20)
+
+def random_color():
+    return [random.randint(50, 255) for _ in range(3)]
+
+def random_position():
+    return random.randint(0, WIDTH), random.randint(0, HEIGHT)
 
 # === CIRCLE CLASS ===
 class Circle:
-    def __init__(self, x, y, r, color, rms):
+    def __init__(self, x, y, r, color, freq, rms):
         self.x = x
         self.y = y
         self.r = r
         self.color = np.array(color, dtype=np.float32)
         self.alpha = 255
+        self.freq = freq
+        self.decay = decay_multiplier_from_frequency(freq, frame_duration)
         self.initial_rms = rms
 
     def update(self, normalized_rms):
-        decay_ratio = normalized_rms
-        self.r *= (0.98 * decay_ratio + 0.02)
+        decay_ratio = self.decay * normalized_rms
+        self.r *= decay_ratio
+        self.r = min(self.r, 40)
         self.alpha *= 0.97
         return self.r > 1 and self.alpha > 5
 
@@ -58,21 +86,6 @@ class Circle:
         color_with_alpha = (*self.color.astype(int), int(self.alpha))
         pygame.draw.circle(s, color_with_alpha, (int(self.x), int(self.y)), max(1, int(self.r)))
         surface.blit(s, (0, 0))
-
-# === AUDIO UTILITIES ===
-def compute_rms(signal):
-    return np.sqrt(np.mean(signal ** 2)) if len(signal) > 0 else 0.0
-
-def detect_new_onset(signal, sr):
-    onset_env = librosa.onset.onset_strength(y=signal, sr=sr)
-    onsets = librosa.onset.onset_detect(onset_envelope=onset_env, sr=sr, units='time')
-    return onsets
-
-def random_color():
-    return [random.randint(50, 255) for _ in range(3)]
-
-def random_position():
-    return random.randint(0, WIDTH), random.randint(0, HEIGHT)
 
 # === AUDIO CALLBACK ===
 def audio_callback(indata, frames, time_info, status):
@@ -91,27 +104,31 @@ def audio_callback(indata, frames, time_info, status):
         now = time.time()
 
         normalized_rms = smoothed_rms / (last_onset_rms + 1e-6)
-        normalized_rms = min(max(normalized_rms, 0.0), 1.0)
+        normalized_rms = np.clip(normalized_rms, 0.0, 2.0)
 
         print(f"🔊 Current RMS: {smoothed_rms:.5f} | Normalized RMS: {normalized_rms:.2f}")
 
-        if smoothed_rms < 0.05:
-            background_color = background_color * 0.95 + np.array([255, 255, 255]) * 0.05
+        # Soft fade to white
+        if smoothed_rms < 0.002:
+            background_color[:] = background_color * 0.95 + np.array([255, 255, 255]) * 0.05
 
         if smoothed_rms > rms_threshold:
             onset_slice = buffer_array[-int(onset_slice_duration * fs):]
-            onsets = detect_new_onset(onset_slice, fs)
+            onsets = librosa.onset.onset_detect(y=onset_slice, sr=fs)
             if len(onsets) > 0 and (now - last_onset_time > onset_cooldown_sec):
                 last_onset_rms = smoothed_rms
                 last_onset_time = now
-                print(f"🎵 Onset detected! Onset RMS: {smoothed_rms:.5f}")
-                target_area = (WIDTH * HEIGHT) / 2
-                max_radius = np.sqrt(target_area / np.pi)
-                size = normalized_rms * max_radius
-                size = int(30 + 200 * min(1.0, smoothed_rms / 0.3))
+                print(f"🎵 Onset detected! RMS: {smoothed_rms:.5f}")
+                freq = estimate_pitch(onset_slice, fs)
+                print(f"🎼 Estimated frequency: {freq:.2f} Hz")
+                # max_area = (WIDTH * HEIGHT) / 2
+                # max_radius = int(np.sqrt(max_area / np.pi))
+                max_radius = 40
+                size = min(max_radius, int(30 + 200 * min(1.0, smoothed_rms / 0.3)))
+                print(f"Size {size}")
                 color = random_color()
                 x, y = random_position()
-                circles.append(Circle(x, y, size, color, smoothed_rms))
+                circles.append(Circle(x, y, size, color, freq, smoothed_rms))
                 if len(circles) > MAX_CIRCLES:
                     circles.pop(0)
 
@@ -119,7 +136,7 @@ def audio_callback(indata, frames, time_info, status):
         for c in circles:
             if c.update(normalized_rms):
                 updated_circles.append(c)
-                background_color = background_color * 0.995 + 0.005 * c.color * c.r/100
+                background_color = background_color * 0.995 + 0.005 * c.color
         circles[:] = updated_circles
 
 # === MAIN LOOP ===
