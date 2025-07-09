@@ -11,7 +11,7 @@ fs = 22050
 frame_duration = 0.05
 frame_samples = int(frame_duration * fs)
 fft_window = 2048
-peak_threshold = 0.3
+peak_threshold = 1.0
 cooldown_time = 0.5  # seconds between onsets per note
 decay_model_A = 39.77
 decay_model_B = -41.52
@@ -54,7 +54,7 @@ def find_note_peaks(signal, sr):
     for i in peaks:
         f = freqs[i]
         amp = spectrum[i]
-        if 30 < f < 4200:  # piano range
+        if 30 < f < 4200 and amp > 8:  # piano range
             detected.append((f, amp))
 
     return detected
@@ -122,6 +122,7 @@ def process_frame():
             updated.append(c)
             background_color[:] = background_color * 0.995 + 0.005 * c.color
     circles[:] = updated
+    background_color[:] = background_color * 0.95 + np.array([255, 255, 255]) * 0.05
 
 # === MAIN LOOP ===
 try:
