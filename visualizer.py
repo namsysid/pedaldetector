@@ -1,60 +1,63 @@
 import numpy as np
 import sounddevice as sd
-import librosa
-import time
 import pygame
 import random
-from collections import deque
+import time
+from scipy.signal import find_peaks
+from scipy.fft import rfft, rfftfreq
 
-# === AUDIO CONFIGURATION ===
+# === CONFIGURATION ===
 fs = 22050
 frame_duration = 0.05
 frame_samples = int(frame_duration * fs)
-buffer_duration = 1.5
-buffer_samples = int(buffer_duration * fs)
-rms_window_duration = 0.2
-rms_window_samples = int(rms_window_duration * fs)
-rms_threshold = 0.01
-onset_cooldown_sec = 0.5
-onset_slice_duration = 0.5
+fft_window = 2048
+peak_threshold = 0.3
+cooldown_time = 0.5  # seconds between onsets per note
+decay_model_A = 39.77
+decay_model_B = -41.52
 
-# === VISUAL CONFIGURATION ===
 WIDTH, HEIGHT = 800, 600
-MAX_CIRCLES = 50
 FPS = 30
+MAX_CIRCLES = 50
 
 # === STATE ===
-audio_buffer = deque(maxlen=buffer_samples)
-rms_history = deque(maxlen=3)
-last_onset_rms = 1e-6
-last_onset_time = 0
+audio_buffer = np.zeros(fft_window)
+last_onset_time = {}
 circles = []
-
-# === LOG-LINEAR DECAY MODEL (from fitted values) ===
-A, B = 39.77, -41.52  # From digitized Figure 8
 
 # === INIT PYGAME ===
 pygame.init()
 screen = pygame.display.set_mode((WIDTH, HEIGHT))
-pygame.display.set_caption("Frequency-Aware Blurriness Visualizer")
+pygame.display.set_caption("Real-Time Piano Visualizer (FFT-based)")
 clock = pygame.time.Clock()
 background_color = np.array([255, 255, 255], dtype=np.float32)
 
-# === HELPER FUNCTIONS ===
-def midi_to_freq(midi_note):
-    return 440.0 * (2 ** ((midi_note - 69) / 12))
+# === UTILITY FUNCTIONS ===
+def midi_to_freq(midi):
+    return 440 * 2 ** ((midi - 69) / 12)
 
-def estimate_pitch(signal, sr):
-    f0 = librosa.yin(signal, fmin=30, fmax=2000, sr=sr)
-    valid_f0 = f0[f0 > 0]
-    return float(np.median(valid_f0)) if len(valid_f0) > 0 else 440.0
+def freq_to_midi(freq):
+    return int(round(69 + 12 * np.log2(freq / 440.0)))
 
-def compute_rms(signal):
-    return np.sqrt(np.mean(signal ** 2)) if len(signal) > 0 else 0.0
+def compute_decay_multiplier(freq):
+    decay_rate = decay_model_A + decay_model_B * np.log10(freq)
+    return 10 ** (decay_rate * frame_duration / 20)
 
-def decay_multiplier_from_frequency(freq, frame_dt):
-    decay_rate = A + B * np.log10(freq)
-    return 10 ** (decay_rate * frame_dt / 20)
+def find_note_peaks(signal, sr):
+    windowed = signal * np.hanning(len(signal))
+    spectrum = np.abs(rfft(windowed))
+    freqs = rfftfreq(len(signal), 1 / sr)
+
+    peaks, _ = find_peaks(spectrum, height=peak_threshold * np.max(spectrum))
+    detected = []
+
+    for i in peaks:
+        f = freqs[i]
+        amp = spectrum[i]
+        if 30 < f < 4200:  # piano range
+            detected.append((f, amp))
+
+    return detected
 
 def random_color():
     return [random.randint(50, 255) for _ in range(3)]
@@ -64,20 +67,18 @@ def random_position():
 
 # === CIRCLE CLASS ===
 class Circle:
-    def __init__(self, x, y, r, color, freq, rms):
+    def __init__(self, x, y, r, color, freq, amp):
         self.x = x
         self.y = y
         self.r = r
         self.color = np.array(color, dtype=np.float32)
         self.alpha = 255
         self.freq = freq
-        self.decay = decay_multiplier_from_frequency(freq, frame_duration)
-        self.initial_rms = rms
+        self.decay = compute_decay_multiplier(freq)
+        self.initial_amp = amp
 
-    def update(self, normalized_rms):
-        decay_ratio = self.decay * normalized_rms
-        self.r *= decay_ratio
-        self.r = min(self.r, 40)
+    def update(self):
+        self.r *= self.decay
         self.alpha *= 0.97
         return self.r > 1 and self.alpha > 5
 
@@ -89,55 +90,38 @@ class Circle:
 
 # === AUDIO CALLBACK ===
 def audio_callback(indata, frames, time_info, status):
-    global last_onset_rms, last_onset_time, circles, background_color
-    if status:
-        print("Stream status:", status)
+    global audio_buffer
     audio_chunk = indata[:, 0]
-    audio_buffer.extend(audio_chunk)
+    audio_buffer = np.concatenate([audio_buffer[len(audio_chunk):], audio_chunk])
 
-    if len(audio_buffer) >= buffer_samples:
-        buffer_array = np.array(audio_buffer)
-        recent_rms_slice = buffer_array[-rms_window_samples:]
-        current_rms = compute_rms(recent_rms_slice)
-        rms_history.append(current_rms)
-        smoothed_rms = np.mean(rms_history)
-        now = time.time()
+# === PROCESS FRAME ===
+def process_frame():
+    global circles, background_color
+    now = time.time()
+    freqs_amplitudes = find_note_peaks(audio_buffer, fs)
 
-        normalized_rms = smoothed_rms / (last_onset_rms + 1e-6)
-        normalized_rms = np.clip(normalized_rms, 0.0, 2.0)
+    for freq, amp in freqs_amplitudes:
+        midi = freq_to_midi(freq)
+        last_time = last_onset_time.get(midi, 0)
 
-        print(f"🔊 Current RMS: {smoothed_rms:.5f} | Normalized RMS: {normalized_rms:.2f}")
+        if now - last_time > cooldown_time:
+            print(f"🎵 Note: {freq:.1f} Hz (MIDI {midi}) | Amp: {amp:.3f}")
+            max_area = (WIDTH * HEIGHT) / 2
+            max_radius = int(np.sqrt(max_area / np.pi))
+            size = min(max_radius, int(30 + 200 * min(1.0, amp)))
+            color = random_color()
+            x, y = random_position()
+            circles.append(Circle(x, y, size, color, freq, amp))
+            if len(circles) > MAX_CIRCLES:
+                circles.pop(0)
+            last_onset_time[midi] = now
 
-        # Soft fade to white
-        if smoothed_rms < 0.002:
-            background_color[:] = background_color * 0.95 + np.array([255, 255, 255]) * 0.05
-
-        if smoothed_rms > rms_threshold:
-            onset_slice = buffer_array[-int(onset_slice_duration * fs):]
-            onsets = librosa.onset.onset_detect(y=onset_slice, sr=fs)
-            if len(onsets) > 0 and (now - last_onset_time > onset_cooldown_sec):
-                last_onset_rms = smoothed_rms
-                last_onset_time = now
-                print(f"🎵 Onset detected! RMS: {smoothed_rms:.5f}")
-                freq = estimate_pitch(onset_slice, fs)
-                print(f"🎼 Estimated frequency: {freq:.2f} Hz")
-                # max_area = (WIDTH * HEIGHT) / 2
-                # max_radius = int(np.sqrt(max_area / np.pi))
-                max_radius = 40
-                size = min(max_radius, int(30 + 200 * min(1.0, smoothed_rms / 0.3)))
-                print(f"Size {size}")
-                color = random_color()
-                x, y = random_position()
-                circles.append(Circle(x, y, size, color, freq, smoothed_rms))
-                if len(circles) > MAX_CIRCLES:
-                    circles.pop(0)
-
-        updated_circles = []
-        for c in circles:
-            if c.update(normalized_rms):
-                updated_circles.append(c)
-                background_color = background_color * 0.995 + 0.005 * c.color
-        circles[:] = updated_circles
+    updated = []
+    for c in circles:
+        if c.update():
+            updated.append(c)
+            background_color[:] = background_color * 0.995 + 0.005 * c.color
+    circles[:] = updated
 
 # === MAIN LOOP ===
 try:
@@ -147,14 +131,13 @@ try:
                 if event.type == pygame.QUIT:
                     raise KeyboardInterrupt
 
+            process_frame()
             screen.fill(background_color.astype(int))
-
             for c in circles:
                 c.draw(screen)
-
             pygame.display.flip()
             clock.tick(FPS)
 
 except KeyboardInterrupt:
-    print("\n🛑 Stopped visualizer.")
+    print("\n🛑 Visualizer stopped.")
     pygame.quit()
