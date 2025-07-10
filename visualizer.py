@@ -5,14 +5,16 @@ import random
 import time
 from scipy.signal import find_peaks
 from scipy.fft import rfft, rfftfreq
+from scipy.optimize import curve_fit
+from collections import deque
 
 # === CONFIGURATION ===
 fs = 22050
 frame_duration = 0.05
 frame_samples = int(frame_duration * fs)
 fft_window = 2048
-peak_threshold = 1.0
-cooldown_time = 0.5  # seconds between onsets per note
+peak_threshold = 0.3
+cooldown_time = 0.5
 decay_model_A = 39.77
 decay_model_B = -41.52
 
@@ -20,22 +22,23 @@ WIDTH, HEIGHT = 800, 600
 FPS = 30
 MAX_CIRCLES = 50
 
+BEAT_HISTORY = 10
+BEAT_SIMILARITY_THRESHOLD = 0.95
+
 # === STATE ===
 audio_buffer = np.zeros(fft_window)
 last_onset_time = {}
+recent_amplitudes = {}  # midi_note: deque[(time, amp)]
 circles = []
 
 # === INIT PYGAME ===
 pygame.init()
 screen = pygame.display.set_mode((WIDTH, HEIGHT))
-pygame.display.set_caption("Real-Time Piano Visualizer (FFT-based)")
+pygame.display.set_caption("Beat-Suppressed Piano Visualizer")
 clock = pygame.time.Clock()
 background_color = np.array([255, 255, 255], dtype=np.float32)
 
-# === UTILITY FUNCTIONS ===
-def midi_to_freq(midi):
-    return 440 * 2 ** ((midi - 69) / 12)
-
+# === UTILITIES ===
 def freq_to_midi(freq):
     return int(round(69 + 12 * np.log2(freq / 440.0)))
 
@@ -47,17 +50,26 @@ def find_note_peaks(signal, sr):
     windowed = signal * np.hanning(len(signal))
     spectrum = np.abs(rfft(windowed))
     freqs = rfftfreq(len(signal), 1 / sr)
-
     peaks, _ = find_peaks(spectrum, height=peak_threshold * np.max(spectrum))
-    detected = []
+    return [(freqs[i], spectrum[i]) for i in peaks if 30 < freqs[i] < 4200]
 
-    for i in peaks:
-        f = freqs[i]
-        amp = spectrum[i]
-        if 30 < f < 4200 and amp > 8:  # piano range
-            detected.append((f, amp))
+def is_beat_modulated(amps):
+    if len(amps) < 2:
+        return False
+    ts, ys = zip(*amps)
+    ts = np.array(ts) - ts[0]
+    ys = np.log10(np.array(ys) + 1e-6)
 
-    return detected
+    def beat_model(t, A, f, phi, offset):
+        return A * np.log10(np.abs(np.cos(2 * np.pi * f * t + phi)) + 0.01) + offset
+
+    try:
+        popt, _ = curve_fit(beat_model, ts, ys, p0=[1.0, 1.0, 0.0, -3.0], maxfev=5000)
+        residuals = ys - beat_model(ts, *popt)
+        r2 = 1 - (np.sum(residuals**2) / np.sum((ys - np.mean(ys))**2))
+        return r2 > BEAT_SIMILARITY_THRESHOLD
+    except Exception:
+        return False
 
 def random_color():
     return [random.randint(50, 255) for _ in range(3)]
@@ -73,9 +85,7 @@ class Circle:
         self.r = r
         self.color = np.array(color, dtype=np.float32)
         self.alpha = 255
-        self.freq = freq
         self.decay = compute_decay_multiplier(freq)
-        self.initial_amp = amp
 
     def update(self):
         self.r *= self.decay
@@ -84,8 +94,7 @@ class Circle:
 
     def draw(self, surface):
         s = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-        color_with_alpha = (*self.color.astype(int), int(self.alpha))
-        pygame.draw.circle(s, color_with_alpha, (int(self.x), int(self.y)), max(1, int(self.r)))
+        pygame.draw.circle(s, (*self.color.astype(int), int(self.alpha)), (int(self.x), int(self.y)), max(1, int(self.r)))
         surface.blit(s, (0, 0))
 
 # === AUDIO CALLBACK ===
@@ -98,31 +107,42 @@ def audio_callback(indata, frames, time_info, status):
 def process_frame():
     global circles, background_color
     now = time.time()
-    freqs_amplitudes = find_note_peaks(audio_buffer, fs)
+    peaks = find_note_peaks(audio_buffer, fs)
 
-    for freq, amp in freqs_amplitudes:
+    for freq, amp in peaks:
+        if amp < 5:
+            continue
         midi = freq_to_midi(freq)
         last_time = last_onset_time.get(midi, 0)
+        # if now - last_time < cooldown_time:
+        #     continue
+        if midi not in recent_amplitudes:
+            recent_amplitudes[midi] = deque(maxlen=BEAT_HISTORY)
+        recent_amplitudes[midi].append((now, amp))
+        # Beat suppression check
+        if is_beat_modulated(recent_amplitudes[midi]):
+            continue
 
         if now - last_time > cooldown_time:
-            print(f"🎵 Note: {freq:.1f} Hz (MIDI {midi}) | Amp: {amp:.3f}")
+            print(f"🎵 {freq:.1f} Hz (MIDI {midi}) | amp: {amp:.3f}")
             max_area = (WIDTH * HEIGHT) / 2
             max_radius = int(np.sqrt(max_area / np.pi))
             size = min(max_radius, int(30 + 200 * min(1.0, amp)))
-            color = random_color()
-            x, y = random_position()
-            circles.append(Circle(x, y, size, color, freq, amp))
+            circles.append(Circle(*random_position(), size, random_color(), freq, amp))
             if len(circles) > MAX_CIRCLES:
                 circles.pop(0)
             last_onset_time[midi] = now
 
-    updated = []
+    background_color[:] = background_color * 0.99 + np.array([255, 255, 255]) * 0.01
+
+    new_circles = []
     for c in circles:
         if c.update():
-            updated.append(c)
+            new_circles.append(c)
             background_color[:] = background_color * 0.995 + 0.005 * c.color
-    circles[:] = updated
-    background_color[:] = background_color * 0.95 + np.array([255, 255, 255]) * 0.05
+    circles[:] = new_circles
+    # if 69 in recent_amplitudes.keys(): #Debugging log, to see how the curve is
+    #     print(recent_amplitudes[69])
 
 # === MAIN LOOP ===
 try:
@@ -131,14 +151,13 @@ try:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     raise KeyboardInterrupt
-
             process_frame()
             screen.fill(background_color.astype(int))
             for c in circles:
                 c.draw(screen)
             pygame.display.flip()
             clock.tick(FPS)
-
 except KeyboardInterrupt:
-    print("\n🛑 Visualizer stopped.")
     pygame.quit()
+    print(recent_amplitudes.get(69, 0))
+    print("🛑 Visualizer stopped.")
