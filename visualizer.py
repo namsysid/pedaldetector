@@ -53,36 +53,37 @@ def find_note_peaks(signal, sr):
     peaks, _ = find_peaks(spectrum, height=peak_threshold * np.max(spectrum))
     return [(freqs[i], spectrum[i]) for i in peaks if 30 < freqs[i] < 4200]
 
-def is_beat_modulated(amps):
-    if len(amps) < 2:
+def is_beat_modulated(amps, last_onset_time, now, tau=0.2, threshold=1.0):
+    if len(amps) < 4:
         return False
-    try:
-        # Fit to previous N-1 points
-        ts_prev, ys_prev = zip(*amps[:-1])
-        ts_prev = np.array(ts_prev) - ts_prev[0]
-        ys_prev = np.log10(np.array(ys_prev) + 1e-6)
-        #Fit to all N points
-        ts_all, ys_all = zip(*amps)
-        ts_all = np.array(ts_all) - ts_all[0]
-        ys_all = np.log10(np.array(ys_all) + 1e-6)
 
-        def beat_model(t, A, f, phi, offset):
-            return A * np.log10(np.abs(np.cos(2 * np.pi * f * t + phi)) + 0.01) + offset
+    ts, ys = zip(*amps)
+    ts = np.array(ts)
+    ys = np.array(ys)
+    delta = ys[-1] - ys[-2]
 
-        popt_prev, _ = curve_fit(beat_model, ts_prev, ys_prev, p0=[1.0, 1.0, 0.0, -3.0], maxfev=5000)
-        res_prev = ys_prev - beat_model(ts_prev, *popt_prev)
-        r2_prev = 1 - (np.sum(res_prev**2) / np.sum((ys_prev - np.mean(ys_prev))**2))
+    # Slope: trend over last few frames
+    slope = (ys[-1] - ys[0]) / (ts[-1] - ts[0] + 1e-6)
 
-        popt_all, _ = curve_fit(beat_model, ts_all, ys_all, p0=popt_prev, maxfev=5000)
-        res_all = ys_all - beat_model(ts_all, *popt_all)
-        r2_all = 1 - (np.sum(res_all**2) / np.sum((ys_all - np.mean(ys_all))**2))
-
-        delta_r2 = r2_all - r2_prev
-
-        return r2_all > BEAT_SIMILARITY_THRESHOLD and delta_r2 > -0.10
-
-    except Exception:
+    # Modulation Index
+    mean_amp = np.mean(ys)
+    if mean_amp == 0:
         return False
+    mi = (np.max(ys) - np.min(ys)) / mean_amp
+
+    # Cooldown penalty (age since last onset for this MIDI note)
+    age = now - last_onset_time
+    cooldown_penalty = np.exp(-age / tau)
+
+    # Final suppression score
+    score = (
+        + 1.0 * delta +
+        + 1.0 * slope +
+        - 3.0 * mi +
+        - 2.5 * cooldown_penalty
+    )
+
+    return score < threshold
 
 def random_color():
     return [random.randint(50, 255) for _ in range(3)]
@@ -133,7 +134,7 @@ def process_frame():
             recent_amplitudes[midi] = deque(maxlen=BEAT_HISTORY)
         recent_amplitudes[midi].append((now, amp))
         # Beat suppression check
-        if is_beat_modulated(recent_amplitudes[midi]):
+        if is_beat_modulated(recent_amplitudes[midi], now - last_onset_time.get(midi, 0), now):
             continue
 
         if now - last_time > cooldown_time:
