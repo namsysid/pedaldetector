@@ -22,7 +22,7 @@ WIDTH, HEIGHT = 800, 600
 FPS = 30
 MAX_CIRCLES = 50
 
-BEAT_HISTORY = 10
+BEAT_HISTORY = 20
 BEAT_SIMILARITY_THRESHOLD = 0.95
 
 # === STATE ===
@@ -56,18 +56,31 @@ def find_note_peaks(signal, sr):
 def is_beat_modulated(amps):
     if len(amps) < 2:
         return False
-    ts, ys = zip(*amps)
-    ts = np.array(ts) - ts[0]
-    ys = np.log10(np.array(ys) + 1e-6)
-
-    def beat_model(t, A, f, phi, offset):
-        return A * np.log10(np.abs(np.cos(2 * np.pi * f * t + phi)) + 0.01) + offset
-
     try:
-        popt, _ = curve_fit(beat_model, ts, ys, p0=[1.0, 1.0, 0.0, -3.0], maxfev=5000)
-        residuals = ys - beat_model(ts, *popt)
-        r2 = 1 - (np.sum(residuals**2) / np.sum((ys - np.mean(ys))**2))
-        return r2 > BEAT_SIMILARITY_THRESHOLD
+        # Fit to previous N-1 points
+        ts_prev, ys_prev = zip(*amps[:-1])
+        ts_prev = np.array(ts_prev) - ts_prev[0]
+        ys_prev = np.log10(np.array(ys_prev) + 1e-6)
+        #Fit to all N points
+        ts_all, ys_all = zip(*amps)
+        ts_all = np.array(ts_all) - ts_all[0]
+        ys_all = np.log10(np.array(ys_all) + 1e-6)
+
+        def beat_model(t, A, f, phi, offset):
+            return A * np.log10(np.abs(np.cos(2 * np.pi * f * t + phi)) + 0.01) + offset
+
+        popt_prev, _ = curve_fit(beat_model, ts_prev, ys_prev, p0=[1.0, 1.0, 0.0, -3.0], maxfev=5000)
+        res_prev = ys_prev - beat_model(ts_prev, *popt_prev)
+        r2_prev = 1 - (np.sum(res_prev**2) / np.sum((ys_prev - np.mean(ys_prev))**2))
+
+        popt_all, _ = curve_fit(beat_model, ts_all, ys_all, p0=popt_prev, maxfev=5000)
+        res_all = ys_all - beat_model(ts_all, *popt_all)
+        r2_all = 1 - (np.sum(res_all**2) / np.sum((ys_all - np.mean(ys_all))**2))
+
+        delta_r2 = r2_all - r2_prev
+
+        return r2_all > BEAT_SIMILARITY_THRESHOLD and delta_r2 > -0.10
+
     except Exception:
         return False
 
