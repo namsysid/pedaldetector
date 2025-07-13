@@ -7,6 +7,8 @@ from scipy.signal import find_peaks
 from scipy.fft import rfft, rfftfreq
 from scipy.optimize import curve_fit
 from collections import deque
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
 
 # === CONFIGURATION ===
 fs = 22050
@@ -14,7 +16,7 @@ frame_duration = 0.05
 frame_samples = int(frame_duration * fs)
 fft_window = 2048
 peak_threshold = 0.3
-cooldown_time = 0.5
+cooldown_time = 0.25
 decay_model_A = 39.77
 decay_model_B = -41.52
 
@@ -53,8 +55,8 @@ def find_note_peaks(signal, sr):
     peaks, _ = find_peaks(spectrum, height=peak_threshold * np.max(spectrum))
     return [(freqs[i], spectrum[i]) for i in peaks if 30 < freqs[i] < 4200]
 
-def is_beat_modulated(amps, last_onset_time, now, tau=0.2, threshold=1.0):
-    if len(amps) < 4:
+def is_beat_modulated(amps, last_onset_time, now, midi, tau=0.75, threshold=0.0):
+    if len(amps) < 2:
         return False
 
     ts, ys = zip(*amps)
@@ -79,9 +81,13 @@ def is_beat_modulated(amps, last_onset_time, now, tau=0.2, threshold=1.0):
     score = (
         + 1.0 * delta +
         + 1.0 * slope +
-        - 3.0 * mi +
-        - 2.5 * cooldown_penalty
+        - 6.0 * mi +
+        - 0.75 * cooldown_penalty
     )
+    if (score < threshold):
+        print("Rejected: " + str(now) + " " + str(midi) + " " + str(ys[-1]) + " --> " + str(score))
+    else:
+        print("Accepted: " + str(now) + " " + str(midi) + " " + str(ys[-1]) + " --> " + str(score))
 
     return score < threshold
 
@@ -90,6 +96,56 @@ def random_color():
 
 def random_position():
     return random.randint(0, WIDTH), random.randint(0, HEIGHT)
+
+#INTERNAL FUNCTIONS
+def visualize_modulation(midi_note=69):
+    midi_note = 69  # A4 or choose any note you're tracking
+    window = 30     # Number of points to display in the plot
+    rms_window = 5  # For RMS smoothing
+
+    fig, ax = plt.subplots()
+    line_amp, = ax.plot([], [], label="Amplitude (ys)", marker='o')
+    line_rms, = ax.plot([], [], label=f"{rms_window}-pt RMS", linestyle='--')
+    ax.set_title(f"Amplitude and RMS for MIDI {midi_note}")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Amplitude")
+    ax.grid(True)
+    ax.legend()
+    ax.set_ylim(0, 1)  # Adjust based on your signal range
+
+    def init():
+        line_amp.set_data([], [])
+        line_rms.set_data([], [])
+        return line_amp, line_rms
+
+    def update(frame):
+        if midi_note not in recent_amplitudes:
+            return line_amp, line_rms
+
+        ts_ys = recent_amplitudes[midi_note][-window:]
+        if len(ts_ys) < 2:
+            return line_amp, line_rms
+
+        ts, ys = zip(*ts_ys)
+        ts = np.array(ts)
+        ys = np.array(ys)
+
+        line_amp.set_data(ts, ys)
+
+        if len(ys) >= rms_window:
+            rms = np.sqrt(np.convolve(np.square(ys), np.ones(rms_window)/rms_window, mode='valid'))
+            rms_ts = ts[rms_window//2 : -(rms_window//2) or None]
+            line_rms.set_data(rms_ts, rms)
+        else:
+            line_rms.set_data([], [])
+
+        ax.set_xlim(ts[0], ts[-1])
+        ax.set_ylim(0, max(1.1 * max(ys), 0.1))  # dynamic range
+        return line_amp, line_rms
+
+    ani = animation.FuncAnimation(fig, update, init_func=init, blit=False, interval=100)
+    plt.tight_layout()
+    plt.show()
 
 # === CIRCLE CLASS ===
 class Circle:
@@ -134,7 +190,7 @@ def process_frame():
             recent_amplitudes[midi] = deque(maxlen=BEAT_HISTORY)
         recent_amplitudes[midi].append((now, amp))
         # Beat suppression check
-        if is_beat_modulated(recent_amplitudes[midi], now - last_onset_time.get(midi, 0), now):
+        if is_beat_modulated(recent_amplitudes[midi], now - last_onset_time.get(midi, 0), now, midi):
             continue
 
         if now - last_time > cooldown_time:
@@ -166,6 +222,7 @@ try:
                 if event.type == pygame.QUIT:
                     raise KeyboardInterrupt
             process_frame()
+            # visualize_modulation(69)
             screen.fill(background_color.astype(int))
             for c in circles:
                 c.draw(screen)
