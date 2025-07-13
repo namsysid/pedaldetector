@@ -169,7 +169,7 @@ class Circle:
             rms = np.sqrt(np.mean(np.square(amps)))
             decay_rate = np.clip(0.9 + (1 - rms) * 0.1, 0.90, 0.999)  # slower fade if RMS is high
         else:
-            decay_rate = 1  # default if not enough data
+            decay_rate = 0.99  # default if not enough data
 
         # self.alpha *= decay_rate
         self.r *= self.decay * decay_rate
