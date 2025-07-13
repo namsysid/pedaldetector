@@ -32,6 +32,7 @@ audio_buffer = np.zeros(fft_window)
 last_onset_time = {}
 recent_amplitudes = {}  # midi_note: deque[(time, amp)]
 circles = []
+detected_list = []
 
 # === INIT PYGAME ===
 pygame.init()
@@ -79,10 +80,10 @@ def is_beat_modulated(amps, last_onset_time, now, midi, tau=0.75, threshold=0.0)
 
     # Final suppression score
     score = (
-        + 1.0 * delta +
-        + 1.0 * slope +
-        - 6.0 * mi +
-        - 0.75 * cooldown_penalty
+        + 1.5931 * delta +
+        + 0.36687 * slope +
+        - 2.20309 * mi +
+        - 0.8063 * cooldown_penalty
     )
     if (score < threshold):
         print("Rejected: " + str(now) + " " + str(midi) + " " + str(ys[-1]) + " --> " + str(score))
@@ -156,10 +157,22 @@ class Circle:
         self.color = np.array(color, dtype=np.float32)
         self.alpha = 255
         self.decay = compute_decay_multiplier(freq)
+        self.freq = freq
+        self.midi = freq_to_midi(freq)
 
     def update(self):
-        self.r *= self.decay
-        self.alpha *= 0.97
+
+        # RMS-based alpha decay
+        if self.midi in recent_amplitudes and len(recent_amplitudes[self.midi]) >= 3:
+            _, amps = zip(*recent_amplitudes[self.midi])
+            amps = np.array(amps[-5:])  # take up to 5 recent points
+            rms = np.sqrt(np.mean(np.square(amps)))
+            decay_rate = np.clip(0.9 + (1 - rms) * 0.1, 0.90, 0.999)  # slower fade if RMS is high
+        else:
+            decay_rate = 1  # default if not enough data
+
+        # self.alpha *= decay_rate
+        self.r *= self.decay * decay_rate
         return self.r > 1 and self.alpha > 5
 
     def draw(self, surface):
@@ -175,7 +188,7 @@ def audio_callback(indata, frames, time_info, status):
 
 # === PROCESS FRAME ===
 def process_frame():
-    global circles, background_color
+    global circles, background_color, detected_list
     now = time.time()
     peaks = find_note_peaks(audio_buffer, fs)
 
@@ -192,6 +205,8 @@ def process_frame():
         # Beat suppression check
         if is_beat_modulated(recent_amplitudes[midi], now - last_onset_time.get(midi, 0), now, midi):
             continue
+
+        detected_list.append(now)
 
         if now - last_time > cooldown_time:
             print(f"🎵 {freq:.1f} Hz (MIDI {midi}) | amp: {amp:.3f}")
@@ -228,6 +243,7 @@ try:
                 c.draw(screen)
             pygame.display.flip()
             clock.tick(FPS)
+            # print(detected_list)
 except KeyboardInterrupt:
     pygame.quit()
     print(recent_amplitudes.get(69, 0))
