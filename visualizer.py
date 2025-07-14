@@ -17,7 +17,7 @@ decay_model_A = 39.77
 decay_model_B = -41.52
 WIDTH, HEIGHT = 800, 600
 FPS = 30
-MAX_CIRCLES = 50
+MAX_CIRCLES = 100
 BEAT_HISTORY = 20
 BUFFER_SECONDS = 2.0
 buffer_samples = int(BUFFER_SECONDS * fs)
@@ -97,7 +97,9 @@ class Circle:
     def update(self, normalized_rms):
         decay_rate = self.decay * normalized_rms
         decay_rate = min(decay_rate, 1)
-        self.r *= decay_rate
+        # self.r *= decay_rate
+        self.r = 100 * decay_rate
+        # if (self.r < 0.)
         self.alpha *= 0.97
         return self.r > 1 and self.alpha > 5
 
