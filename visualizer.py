@@ -27,7 +27,9 @@ onset_window = int(0.5 * fs)
 audio_buffer = np.zeros(buffer_samples)
 last_onset_time = {}
 recent_amplitudes = {}
-circles = []
+circles_by_midi = {}
+color_by_midi = {}
+last_onset_amp_by_midi = {}
 last_onset_rms = 1e-6
 background_color = np.array([255, 255, 255], dtype=np.float32)
 
@@ -85,22 +87,28 @@ def random_position():
 
 # === CIRCLE CLASS ===
 class Circle:
-    def __init__(self, x, y, r, color, freq, amp):
+    def __init__(self, x, y, r, color, freq, amp, midi):
         self.x = x
         self.y = y
         self.r = r
         self.color = np.array(color, dtype=np.float32)
         self.alpha = 255
-        # self.decay = compute_decay_multiplier(freq)
+        self.freq = freq
+        self.amp = amp
+        self.midi = midi
         self.decay = 1
 
-    def update(self, normalized_rms):
+    def update(self, fft_peaks):
+        self.amp = next((amp for freq, amp in fft_peaks if freq_to_midi(freq) == self.midi), self.amp * 0.98)
+        normalized_rms = self.amp / (last_onset_amp_by_midi.get(self.midi, self.amp) + 1e-6)
         decay_rate = self.decay * normalized_rms
         decay_rate = min(decay_rate, 1)
         # self.r *= decay_rate
-        self.r = 100 * decay_rate
-        # if (self.r < 0.)
-        self.alpha *= 0.97
+        self.r = normalized_rms * 58
+        # self.alpha *= 0.97
+        global background_color
+        self.color = np.clip(self.color, 0, 255)
+        background_color += 0.0025 * (self.color - background_color)
         return self.r > 1 and self.alpha > 5
 
     def draw(self, surface):
@@ -117,12 +125,11 @@ class Circle:
 def process_frame():
     global last_onset_rms
 
-    # Compute current RMS from last 0.5s of buffer
     current_rms = compute_rms(audio_buffer[-onset_window:])
     normalized_rms = current_rms / (last_onset_rms + 1e-6)
     now = time.time()
+    print(normalized_rms)
 
-    # Run FFT peak detection
     peaks = find_note_peaks(audio_buffer[-fft_window:], fs)
 
     for freq, amp in peaks:
@@ -142,34 +149,50 @@ def process_frame():
             print(f"🎵 {freq:.1f} Hz (MIDI {midi}) | amp: {amp:.3f}")
             max_radius = 40
             size = min(max_radius, int(30 + 200 * min(1.0, amp / 100)))
-            circles.append(Circle(*random_position(), size, random_color(), freq, amp))
-            if len(circles) > MAX_CIRCLES:
-                circles.pop(0)
+            last_onset_amp_by_midi[midi] = amp
+            if midi not in color_by_midi:
+                color_by_midi[midi] = random_color()
+
+            if midi in circles_by_midi:
+                circle = circles_by_midi[midi]
+                circle.r = size
+                circle.amp = amp
+            else:
+                circles_by_midi[midi] = Circle(*random_position(), size, color_by_midi[midi], freq, amp, midi)
+
             last_onset_time[midi] = now
             last_onset_rms = current_rms
-    background_color[:] = background_color * 0.975 + np.array([255, 255, 255]) * 0.025
 
-    # Update circles with shared normalized RMS
-    new_circles = []
-    for c in circles:
-        if c.update(normalized_rms):
-            new_circles.append(c)
-            background_color[:] = background_color * 0.995 + 0.005 * c.color
-    circles[:] = new_circles
+# === AUDIO CALLBACK ===
+def audio_callback(indata, frames, time_info, status):
+    global audio_buffer
+    audio_buffer = np.roll(audio_buffer, -frames)
+    audio_buffer[-frames:] = indata[:, 0]
 
 # === MAIN LOOP ===
-try:
-    with sd.InputStream(channels=1, samplerate=fs, blocksize=frame_samples, callback=lambda indata, frames, time_info, status: audio_buffer.__setitem__(slice(None), np.roll(audio_buffer, -len(indata[:, 0]))) or audio_buffer.__setitem__(slice(-len(indata[:, 0]), None), indata[:, 0])):
-        while True:
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    raise KeyboardInterrupt
-            process_frame()
-            screen.fill(background_color.astype(int))
-            for c in circles:
-                c.draw(screen)
-            pygame.display.flip()
-            clock.tick(FPS)
-except KeyboardInterrupt:
-    pygame.quit()
-    print("🛑 Visualizer stopped.")
+stream = sd.InputStream(callback=audio_callback, channels=1, samplerate=fs, blocksize=frame_samples)
+with stream:
+    running = True
+    while running:
+        background_color += 0.05 * (255 - background_color)
+        screen.fill(background_color.astype(int))
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+
+        process_frame()
+
+        fft_peaks = find_note_peaks(audio_buffer[-fft_window:], fs)
+        expired = []
+        for midi, circle in circles_by_midi.items():
+            if not circle.update(fft_peaks):
+                expired.append(midi)
+        for midi in expired:
+            del circles_by_midi[midi]
+
+        for circle in circles_by_midi.values():
+            circle.draw(screen)
+
+        pygame.display.flip()
+        clock.tick(FPS)
