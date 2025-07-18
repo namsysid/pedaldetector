@@ -5,6 +5,7 @@ import random
 import time
 from scipy.signal import find_peaks
 from scipy.fft import rfft, rfftfreq
+import librosa
 from collections import deque
 
 # === CONFIGURATION ===
@@ -108,7 +109,8 @@ class Circle:
         # self.alpha *= 0.97
         global background_color
         self.color = np.clip(self.color, 0, 255)
-        background_color += 0.0025 * (self.color - background_color)
+        if self.amp / (last_onset_amp_by_midi.get(self.midi, self.amp) + 1e-6) < 0.5 and self.amp / (last_onset_amp_by_midi.get(self.midi, self.amp) + 1e-6) > 0.05:
+            background_color += 0.00375 * (self.color - background_color)
         return self.r > 1 and self.alpha > 5
 
     def draw(self, surface):
@@ -121,14 +123,29 @@ class Circle:
         )
         surface.blit(s, (0, 0))
 
+#INTERNALS
+prev_spectrum = np.zeros(fft_window // 2 + 1)  # init at global scope
+
+def compute_spectral_flux(signal):
+    global prev_spectrum
+    windowed = signal * np.hanning(len(signal))
+    current_spectrum = np.abs(rfft(windowed))
+    
+    flux = np.sum((np.maximum(0, current_spectrum - prev_spectrum)) ** 2)
+    prev_spectrum = current_spectrum
+    return flux
+
 # === PROCESS FRAME ===
 def process_frame():
     global last_onset_rms
 
     current_rms = compute_rms(audio_buffer[-onset_window:])
+    flux = compute_spectral_flux(audio_buffer[-fft_window:])
     normalized_rms = current_rms / (last_onset_rms + 1e-6)
     now = time.time()
-    print(normalized_rms)
+    # print(str(normalized_rms) + " Flux " + str(flux))
+    if flux != 0.0:
+        print(flux)
 
     peaks = find_note_peaks(audio_buffer[-fft_window:], fs)
 
@@ -146,7 +163,7 @@ def process_frame():
             continue
 
         if now - last_time > cooldown_time:
-            print(f"🎵 {freq:.1f} Hz (MIDI {midi}) | amp: {amp:.3f}")
+            # print(f"🎵 {freq:.1f} Hz (MIDI {midi}) | amp: {amp:.3f}")
             max_radius = 40
             size = min(max_radius, int(30 + 200 * min(1.0, amp / 100)))
             last_onset_amp_by_midi[midi] = amp
