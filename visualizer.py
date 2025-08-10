@@ -53,12 +53,79 @@ def compute_decay_multiplier(freq):
     decay_rate = decay_model_A + decay_model_B * np.log10(freq)
     return 10 ** (decay_rate * frame_duration / 20)
 
-def find_note_peaks(signal, sr):
-    windowed = signal * np.hanning(len(signal))
-    spectrum = np.abs(rfft(windowed))
-    freqs = rfftfreq(len(signal), 1 / sr)
-    peaks, _ = find_peaks(spectrum, height=0.3 * np.max(spectrum) if np.max(spectrum) > 0 else 0)
-    return [(freqs[i], spectrum[i]) for i in peaks if 30 < freqs[i] < 4200]
+def find_note_peaks(
+    signal: np.ndarray,
+    sample_rate: float,
+    min_freq: float = 30.0,
+    max_freq: float = 4200.0,
+    min_prominence_db: float = 18.0,
+    max_peaks: int = 24,
+):
+    """
+    Return a list of (frequency_Hz, amp_rms) peaks for the current frame.
+
+    amp_rms is a window- and FFT-scaled RMS-like amplitude per bin, directly
+    comparable in scale to time-domain RMS over the same frame.
+
+    Key normalization (NumPy FFT):
+        power[k] = |X[k]|^2 / (N * sum(hann^2))
+        amp_rms[k] = sqrt(power[k])
+
+    Peak picking is band-limited and uses a median-noise-floor prominence test.
+    """
+    x = np.asarray(signal)
+    N = int(x.shape[0])
+    if N < 4:
+        return []
+
+    # Windowed RFFT
+    w = np.hanning(N)
+    X = np.fft.rfft(x * w)
+    freqs = np.fft.rfftfreq(N, d=1.0 / sample_rate)
+
+    # Correct power normalization for NumPy's FFT scaling:
+    # Parseval -> sum|y[n]|^2 = (1/N) sum|Y[k]|^2
+    # Using window y = x*w: normalize by N * sum(w^2)
+    W = float(np.sum(w * w)) + 1e-20
+    power = (np.abs(X) ** 2) / (N * W)
+
+    # Per-bin RMS-like amplitude
+    amp_rms = np.sqrt(power + 1e-30)
+
+    # Band-limit
+    band_mask = (freqs >= min_freq) & (freqs <= max_freq)
+    if not np.any(band_mask):
+        return []
+    f = freqs[band_mask]
+    a = amp_rms[band_mask]
+    p = power[band_mask]
+    if a.size < 3:
+        return []
+
+    # Local-maximum peak detection (no extra deps)
+    left = a[1:-1] > a[:-2]
+    right = a[1:-1] >= a[2:]
+    idx = np.nonzero(left & right)[0] + 1
+    if idx.size == 0:
+        return []
+
+    # Prominence vs median noise floor (in dB, using power)
+    noise_floor = np.median(p) + 1e-30
+    prom_db = 10.0 * np.log10(p[idx] / noise_floor + 1e-30)
+    keep = prom_db >= float(min_prominence_db)
+    if not np.any(keep):
+        return []
+    idx = idx[keep]
+
+    # Top-N by power, then sort by amplitude desc
+    if idx.size > max_peaks:
+        top = np.argpartition(-p[idx], max_peaks - 1)[:max_peaks]
+        idx = idx[top]
+    order = np.argsort(-a[idx])
+    idx = idx[order]
+
+    # Return (freq_hz, amp_rms)
+    return [(float(f[i]), float(a[i])) for i in idx]
 
 def compute_rms(signal):
     return np.sqrt(np.mean(signal ** 2)) if len(signal) > 0 else 0.0
@@ -90,12 +157,14 @@ class Circle:
 
         # Keep radius tied to per-note normalized amp (against that note's last onset amp)
         normalized_note = self.amp / (last_onset_amp_by_midi.get(self.midi, self.amp) + 1e-6)
-        self.r = max(1.0, float(normalized_note) * 58.0)
+        self.r = min(250, float(self.amp) * 5000.0)
         glob_normalized_note = self.amp / (max_recent + 1e-6)
+        if max_recent < 0.01:
+            glob_normalized_note = 0.0
         if self.midi == 69:
-            print(max_recent)
+            print(glob_normalized_note)
         # NEW: bleed based ONLY on global normalized RMS vs threshold
-        if glob_normalized_note >= GLOBAL_RMS_BLEED_THRESH:
+        if glob_normalized_note >= 0.001 and glob_normalized_note < 0.2:
             background_color += 0.007 * (self.color - background_color)
 
         return self.r > 1 and self.alpha > 5
@@ -121,7 +190,8 @@ def process_frame():
     recent_global_rms.append(current_rms)
     max_recent = max(recent_global_rms) if recent_global_rms else (current_rms + 1e-6)
     normalized_global_rms = current_rms / (max_recent + 1e-6)
-
+    if (max_recent < 0.01):
+        normalized_global_rms = 0.0
     peaks = find_note_peaks(audio_buffer[-fft_window:], fs)
     if not peaks:
         return
@@ -129,7 +199,7 @@ def process_frame():
     # Only trigger the loudest note every 100ms
     if now - last_loudest_time >= loudest_note_interval:
         freq, amp = max(peaks, key=lambda p: p[1])
-        if amp < 5:
+        if amp < 0.001:
             return
         midi = freq_to_midi(freq)
         last_time = last_onset_time.get(midi, 0)
@@ -172,7 +242,8 @@ with stream:
 
         process_frame()
 
-        if normalized_global_rms > 0.07:
+        # print(normalized_global_rms)
+        if normalized_global_rms > 0.007:
             background_color += 0.085 * (255 - background_color)
         else:
             background_color = 255.0
