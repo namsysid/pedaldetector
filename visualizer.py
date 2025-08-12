@@ -136,6 +136,60 @@ def random_color():
 def random_position():
     return random.randint(0, WIDTH), random.randint(0, HEIGHT)
 
+def measure_interharmonic_broadband_rms(audio_frame, sr, peaks=None,
+                                        peak_mask_hz=30.0, highband_hz=5000.0,
+                                        print_prefix="PEDAL"):
+    """
+    Compute & print inter-harmonic (peak-masked) RMS and high-band RMS from a single audio frame.
+    - Causal (uses only the given frame).
+    - Inter-harmonic floor: masks ±peak_mask_hz around detected spectral peaks.
+    - High-band RMS: RMS above highband_hz (e.g., >5 kHz for undamped-string hiss).
+    """
+    if audio_frame is None or len(audio_frame) == 0:
+        return
+
+    # Window + spectrum
+    window = np.hanning(len(audio_frame))
+    frame = audio_frame * window
+    spec = np.abs(rfft(frame))
+    freqs = rfftfreq(len(audio_frame), 1.0 / sr)
+
+    # Get peaks (use existing function if peaks not supplied)
+    if peaks is None:
+        try:
+            peak_list = find_note_peaks(audio_frame, sr)  # expects list of (freq, mag)
+        except Exception:
+            peak_list = []
+    else:
+        peak_list = peaks
+
+    # Build mask for "inter-harmonic" regions (exclude bins near peaks)
+    mask = np.ones_like(spec, dtype=bool)
+
+    # avoid DC/ultra-low
+    mask &= freqs >= 30.0
+
+    # exclude ±peak_mask_hz around each detected peak frequency
+    for (pf, _pmag) in peak_list:
+        left = pf - peak_mask_hz
+        right = pf + peak_mask_hz
+        mask &= ~((freqs >= left) & (freqs <= right))
+
+    # Inter-harmonic RMS (masked bins)
+    inter_bins = spec[mask]
+    inter_rms = float(np.sqrt(np.mean(inter_bins ** 2))) if inter_bins.size else 0.0
+
+    # High-band RMS (e.g., >5 kHz) — broadband cue for undamped strings
+    hb_mask = freqs >= highband_hz
+    hb_bins = spec[hb_mask]
+    highband_rms = float(np.sqrt(np.mean(hb_bins ** 2))) if hb_bins.size else 0.0
+
+    # Print in dB for easy thresholding (relative scale)
+    eps = 1e-12
+    inter_db = 20.0 * np.log10(inter_rms + eps)
+    highband_db = 20.0 * np.log10(highband_rms + eps)
+    print(f"{print_prefix} interharmonic_rms_db={inter_db:.2f}  highband_rms_db={highband_db:.2f}")
+
 # === CIRCLE ===
 class Circle:
     def __init__(self, x, y, r, color, freq, amp, midi):
@@ -161,8 +215,8 @@ class Circle:
         glob_normalized_note = self.amp / (max_recent + 1e-6)
         if max_recent < 0.01:
             glob_normalized_note = 0.0
-        if self.midi == 69:
-            print(glob_normalized_note)
+        # if self.midi == 69:
+        #     print(glob_normalized_note)
         # NEW: bleed based ONLY on global normalized RMS vs threshold
         if glob_normalized_note >= 0.001 and glob_normalized_note < 0.2:
             background_color += 0.007 * (self.color - background_color)
@@ -249,6 +303,14 @@ with stream:
             background_color = 255.0
 
         fft_peaks = find_note_peaks(audio_buffer[-fft_window:], fs)
+        measure_interharmonic_broadband_rms(
+            audio_frame=audio_buffer[-fft_window:], 
+            sr=fs, 
+            peaks=fft_peaks,              # optional; pass None to let the function call find_note_peaks itself
+            peak_mask_hz=30.0,            # tweak: 20–40 Hz works well
+            highband_hz=5000.0,           # tweak: 5–6 kHz at 22.05 kHz SR
+            print_prefix="PEDAL"
+        )
         expired = []
         for midi, circle in list(circles_by_midi.items()):
             if not circle.update(fft_peaks):
