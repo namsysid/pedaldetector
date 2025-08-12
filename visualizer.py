@@ -25,6 +25,16 @@ GLOBAL_RMS_BLEED_THRESH = 0.25            # NEW: threshold on normalized global 
 buffer_samples = int(BUFFER_SECONDS * fs)
 onset_window = int(0.5 * fs)
 loudest_note_interval = 0.1  # seconds
+bleed_rate = 0.007
+alpha = 0.2               # smoothing factor for EMA (~0.2 = ~200 ms smoothing at 25 Hz updates)
+# th_on = -28.0              # dB threshold to turn ON
+# th_off = -32.0             # dB threshold to turn OFF
+# min_time_in_state = 0.15   # seconds to require before switching
+pedal_threshold = -30
+
+# Persistent variables
+pedal_state = 0
+smoothed_level = None
 
 # === STATE ===
 recent_global_rms = deque(maxlen=int(GLOBAL_RMS_WINDOW_SEC / frame_duration))
@@ -136,6 +146,48 @@ def random_color():
 def random_position():
     return random.randint(0, WIDTH), random.randint(0, HEIGHT)
 
+# Time tracking
+last_switch_time = time.time()
+
+def update_pedal_state(current_level_db, global_db):
+    global pedal_state, smoothed_level, pedal_threshold
+
+    now = time.time()
+
+    # Initialize smoother
+    if smoothed_level is None:
+        smoothed_level = current_level_db
+
+    # Exponential moving average smoothing
+    smoothed_level = (1 - alpha) * smoothed_level + alpha * current_level_db
+    relative_level = smoothed_level - global_db
+    if (global_db < -26):
+        relative_level = global_db - 26
+    # if smoothed_level > -40:
+    #     print(relative_level)
+    if smoothed_level > -35:
+        pedal_state = max(0, relative_level - pedal_threshold)
+    else:
+        pedal_state = 0
+    
+    print(smoothed_level, global_db)
+
+    # State machine with hysteresis
+    # if not pedal_state:
+    #     # Currently OFF, check if we should turn ON
+    #     if smoothed_level > th_on and (now - last_switch_time) > min_time_in_state:
+    #         pedal_state = True
+    #         last_switch_time = now
+    #         print("PEDAL: ON")
+    # else:
+    #     # Currently ON, check if we should turn OFF
+    #     if smoothed_level < th_off and (now - last_switch_time) > min_time_in_state:
+    #         pedal_state = False
+    #         last_switch_time = now
+    #         print("PEDAL: OFF")
+
+    # return pedal_state, smoothed_level
+
 def measure_interharmonic_broadband_rms(audio_frame, sr, peaks=None,
                                         peak_mask_hz=30.0, highband_hz=5000.0,
                                         print_prefix="PEDAL"):
@@ -153,6 +205,8 @@ def measure_interharmonic_broadband_rms(audio_frame, sr, peaks=None,
     frame = audio_frame * window
     spec = np.abs(rfft(frame))
     freqs = rfftfreq(len(audio_frame), 1.0 / sr)
+    global_rms = float(np.sqrt(np.mean(spec ** 2)))
+    global_rms_db = 20.0 * np.log10(global_rms + 1e-12)
 
     # Get peaks (use existing function if peaks not supplied)
     if peaks is None:
@@ -188,7 +242,8 @@ def measure_interharmonic_broadband_rms(audio_frame, sr, peaks=None,
     eps = 1e-12
     inter_db = 20.0 * np.log10(inter_rms + eps)
     highband_db = 20.0 * np.log10(highband_rms + eps)
-    print(f"{print_prefix} interharmonic_rms_db={inter_db:.2f}  highband_rms_db={highband_db:.2f}")
+    update_pedal_state(inter_db, global_rms_db)
+    # print(f"{print_prefix} interharmonic_rms_db={inter_db:.2f}  highband_rms_db={highband_db:.2f}")
 
 # === CIRCLE ===
 class Circle:
@@ -204,7 +259,7 @@ class Circle:
         self.decay = 1
 
     def update(self, fft_peaks):
-        global background_color, normalized_global_rms, max_recent
+        global background_color, normalized_global_rms, max_recent, pedal_state
 
         # Track live amp for this MIDI (fallback slight decay)
         self.amp = next((amp for freq, amp in fft_peaks if freq_to_midi(freq) == self.midi), self.amp * 0.98)
@@ -217,9 +272,8 @@ class Circle:
             glob_normalized_note = 0.0
         # if self.midi == 69:
         #     print(glob_normalized_note)
-        # NEW: bleed based ONLY on global normalized RMS vs threshold
-        if glob_normalized_note >= 0.001 and glob_normalized_note < 0.2:
-            background_color += 0.007 * (self.color - background_color)
+        # NEW: bleed on pedal state
+        background_color += 0.007 * pedal_state * (self.color - background_color)
 
         return self.r > 1 and self.alpha > 5
 
