@@ -20,24 +20,32 @@ FPS = 30
 MAX_CIRCLES = 100
 BEAT_HISTORY = 20
 BUFFER_SECONDS = 2.0
+GLOBAL_RMS_WINDOW_SEC = 10.0               # NEW: rolling window for global RMS max
+GLOBAL_RMS_BLEED_THRESH = 0.25            # NEW: threshold on normalized global RMS to allow bleed
 buffer_samples = int(BUFFER_SECONDS * fs)
 onset_window = int(0.5 * fs)
+loudest_note_interval = 0.1  # seconds
 
 # === STATE ===
+recent_global_rms = deque(maxlen=int(GLOBAL_RMS_WINDOW_SEC / frame_duration))
+normalized_global_rms = 0.0
 audio_buffer = np.zeros(buffer_samples)
 last_onset_time = {}
 recent_amplitudes = {}
-circles = []
+circles_by_midi = {}
+color_by_midi = {}
+last_onset_amp_by_midi = {}
 last_onset_rms = 1e-6
 background_color = np.array([255, 255, 255], dtype=np.float32)
+last_loudest_time = 0
 
 # === INIT PYGAME ===
 pygame.init()
 screen = pygame.display.set_mode((WIDTH, HEIGHT))
-pygame.display.set_caption("Frequency-Aware RMS Decay Visualizer")
+pygame.display.set_caption("RMS Visualizer (Global-RMS Bleed)")
 clock = pygame.time.Clock()
 
-# === UTILITIES ===
+# === UTILS ===
 def freq_to_midi(freq):
     return int(round(69 + 12 * np.log2(freq / 440.0)))
 
@@ -45,62 +53,120 @@ def compute_decay_multiplier(freq):
     decay_rate = decay_model_A + decay_model_B * np.log10(freq)
     return 10 ** (decay_rate * frame_duration / 20)
 
-def find_note_peaks(signal, sr):
-    windowed = signal * np.hanning(len(signal))
-    spectrum = np.abs(rfft(windowed))
-    freqs = rfftfreq(len(signal), 1 / sr)
-    peaks, _ = find_peaks(spectrum, height=0.3 * np.max(spectrum))
-    return [(freqs[i], spectrum[i]) for i in peaks if 30 < freqs[i] < 4200]
+def find_note_peaks(
+    signal: np.ndarray,
+    sample_rate: float,
+    min_freq: float = 30.0,
+    max_freq: float = 4200.0,
+    min_prominence_db: float = 18.0,
+    max_peaks: int = 24,
+):
+    """
+    Return a list of (frequency_Hz, amp_rms) peaks for the current frame.
+
+    amp_rms is a window- and FFT-scaled RMS-like amplitude per bin, directly
+    comparable in scale to time-domain RMS over the same frame.
+
+    Key normalization (NumPy FFT):
+        power[k] = |X[k]|^2 / (N * sum(hann^2))
+        amp_rms[k] = sqrt(power[k])
+
+    Peak picking is band-limited and uses a median-noise-floor prominence test.
+    """
+    x = np.asarray(signal)
+    N = int(x.shape[0])
+    if N < 4:
+        return []
+
+    # Windowed RFFT
+    w = np.hanning(N)
+    X = np.fft.rfft(x * w)
+    freqs = np.fft.rfftfreq(N, d=1.0 / sample_rate)
+
+    # Correct power normalization for NumPy's FFT scaling:
+    # Parseval -> sum|y[n]|^2 = (1/N) sum|Y[k]|^2
+    # Using window y = x*w: normalize by N * sum(w^2)
+    W = float(np.sum(w * w)) + 1e-20
+    power = (np.abs(X) ** 2) / (N * W)
+
+    # Per-bin RMS-like amplitude
+    amp_rms = np.sqrt(power + 1e-30)
+
+    # Band-limit
+    band_mask = (freqs >= min_freq) & (freqs <= max_freq)
+    if not np.any(band_mask):
+        return []
+    f = freqs[band_mask]
+    a = amp_rms[band_mask]
+    p = power[band_mask]
+    if a.size < 3:
+        return []
+
+    # Local-maximum peak detection (no extra deps)
+    left = a[1:-1] > a[:-2]
+    right = a[1:-1] >= a[2:]
+    idx = np.nonzero(left & right)[0] + 1
+    if idx.size == 0:
+        return []
+
+    # Prominence vs median noise floor (in dB, using power)
+    noise_floor = np.median(p) + 1e-30
+    prom_db = 10.0 * np.log10(p[idx] / noise_floor + 1e-30)
+    keep = prom_db >= float(min_prominence_db)
+    if not np.any(keep):
+        return []
+    idx = idx[keep]
+
+    # Top-N by power, then sort by amplitude desc
+    if idx.size > max_peaks:
+        top = np.argpartition(-p[idx], max_peaks - 1)[:max_peaks]
+        idx = idx[top]
+    order = np.argsort(-a[idx])
+    idx = idx[order]
+
+    # Return (freq_hz, amp_rms)
+    return [(float(f[i]), float(a[i])) for i in idx]
 
 def compute_rms(signal):
     return np.sqrt(np.mean(signal ** 2)) if len(signal) > 0 else 0.0
 
-def is_beat_modulated(amps, last_onset_time, now, midi, tau=0.75, threshold=0.0):
-    if len(amps) < 2:
-        return False
-    ts, ys = zip(*amps)
-    ts = np.array(ts)
-    ys = np.array(ys)
-    delta = ys[-1] - ys[-2]
-    slope = (ys[-1] - ys[0]) / (ts[-1] - ts[0] + 1e-6)
-    mean_amp = np.mean(ys)
-    if mean_amp == 0:
-        return False
-    mi = (np.max(ys) - np.min(ys)) / mean_amp
-    age = now - last_onset_time
-    cooldown_penalty = np.exp(-age / tau)
-    score = (
-        + 0.0559 * delta +
-        + 4.966 * slope +
-        - 0.959 * mi +
-        - 0.0 * cooldown_penalty
-    )
-    return score < threshold
-
 def random_color():
-    return [random.randint(50, 255) for _ in range(3)]
+    return [random.randint(0, 100) for _ in range(3)]
 
 def random_position():
     return random.randint(0, WIDTH), random.randint(0, HEIGHT)
 
-# === CIRCLE CLASS ===
+# === CIRCLE ===
 class Circle:
-    def __init__(self, x, y, r, color, freq, amp):
+    def __init__(self, x, y, r, color, freq, amp, midi):
         self.x = x
         self.y = y
         self.r = r
         self.color = np.array(color, dtype=np.float32)
         self.alpha = 255
-        # self.decay = compute_decay_multiplier(freq)
+        self.freq = freq
+        self.amp = amp
+        self.midi = midi
         self.decay = 1
 
-    def update(self, normalized_rms):
-        decay_rate = self.decay * normalized_rms
-        decay_rate = min(decay_rate, 1)
-        # self.r *= decay_rate
-        self.r = 100 * decay_rate
-        # if (self.r < 0.)
-        self.alpha *= 0.97
+    def update(self, fft_peaks):
+        global background_color, normalized_global_rms, max_recent
+
+        # Track live amp for this MIDI (fallback slight decay)
+        self.amp = next((amp for freq, amp in fft_peaks if freq_to_midi(freq) == self.midi), self.amp * 0.98)
+
+        # Keep radius tied to per-note normalized amp (against that note's last onset amp)
+        normalized_note = self.amp / (last_onset_amp_by_midi.get(self.midi, self.amp) + 1e-6)
+        self.r = min(250, float(self.amp) * 5000.0)
+        glob_normalized_note = self.amp / (max_recent + 1e-6)
+        if max_recent < 0.01:
+            glob_normalized_note = 0.0
+        if self.midi == 69:
+            print(glob_normalized_note)
+        # NEW: bleed based ONLY on global normalized RMS vs threshold
+        if glob_normalized_note >= 0.001 and glob_normalized_note < 0.2:
+            background_color += 0.007 * (self.color - background_color)
+
         return self.r > 1 and self.alpha > 5
 
     def draw(self, surface):
@@ -115,61 +181,83 @@ class Circle:
 
 # === PROCESS FRAME ===
 def process_frame():
-    global last_onset_rms
+    global last_onset_rms, last_loudest_time, normalized_global_rms, max_recent
 
-    # Compute current RMS from last 0.5s of buffer
-    current_rms = compute_rms(audio_buffer[-onset_window:])
-    normalized_rms = current_rms / (last_onset_rms + 1e-6)
     now = time.time()
 
-    # Run FFT peak detection
+    # Global RMS for this frame; update rolling window & normalized metric
+    current_rms = compute_rms(audio_buffer[-onset_window:])
+    recent_global_rms.append(current_rms)
+    max_recent = max(recent_global_rms) if recent_global_rms else (current_rms + 1e-6)
+    normalized_global_rms = current_rms / (max_recent + 1e-6)
+    if (max_recent < 0.01):
+        normalized_global_rms = 0.0
     peaks = find_note_peaks(audio_buffer[-fft_window:], fs)
+    if not peaks:
+        return
 
-    for freq, amp in peaks:
-        if amp < 5:
-            continue
+    # Only trigger the loudest note every 100ms
+    if now - last_loudest_time >= loudest_note_interval:
+        freq, amp = max(peaks, key=lambda p: p[1])
+        if amp < 0.001:
+            return
         midi = freq_to_midi(freq)
         last_time = last_onset_time.get(midi, 0)
 
-        if midi not in recent_amplitudes:
-            recent_amplitudes[midi] = deque(maxlen=BEAT_HISTORY)
-        recent_amplitudes[midi].append((now, amp))
-
-        if is_beat_modulated(recent_amplitudes[midi], last_time, now, midi):
-            continue
-
         if now - last_time > cooldown_time:
-            print(f"🎵 {freq:.1f} Hz (MIDI {midi}) | amp: {amp:.3f}")
-            max_radius = 40
-            size = min(max_radius, int(30 + 200 * min(1.0, amp / 100)))
-            circles.append(Circle(*random_position(), size, random_color(), freq, amp))
-            if len(circles) > MAX_CIRCLES:
-                circles.pop(0)
+            if midi not in color_by_midi:
+                color_by_midi[midi] = random_color()
+            last_onset_amp_by_midi[midi] = amp
+
+            if midi in circles_by_midi:
+                circle = circles_by_midi[midi]
+                circle.r = amp
+                circle.amp = amp
+            else:
+                circles_by_midi[midi] = Circle(*random_position(), amp, color_by_midi[midi], freq, amp, midi)
+
             last_onset_time[midi] = now
             last_onset_rms = current_rms
-    background_color[:] = background_color * 0.975 + np.array([255, 255, 255]) * 0.025
+            last_loudest_time = now
 
-    # Update circles with shared normalized RMS
-    new_circles = []
-    for c in circles:
-        if c.update(normalized_rms):
-            new_circles.append(c)
-            background_color[:] = background_color * 0.995 + 0.005 * c.color
-    circles[:] = new_circles
+# === AUDIO CALLBACK ===
+def audio_callback(indata, frames, time_info, status):
+    global audio_buffer
+    audio_buffer = np.roll(audio_buffer, -frames)
+    audio_buffer[-frames:] = indata[:, 0]
 
 # === MAIN LOOP ===
-try:
-    with sd.InputStream(channels=1, samplerate=fs, blocksize=frame_samples, callback=lambda indata, frames, time_info, status: audio_buffer.__setitem__(slice(None), np.roll(audio_buffer, -len(indata[:, 0]))) or audio_buffer.__setitem__(slice(-len(indata[:, 0]), None), indata[:, 0])):
-        while True:
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    raise KeyboardInterrupt
-            process_frame()
-            screen.fill(background_color.astype(int))
-            for c in circles:
-                c.draw(screen)
-            pygame.display.flip()
-            clock.tick(FPS)
-except KeyboardInterrupt:
-    pygame.quit()
-    print("🛑 Visualizer stopped.")
+stream = sd.InputStream(callback=audio_callback, channels=1, samplerate=fs, blocksize=frame_samples)
+with stream:
+    running = True
+    while running:
+        if isinstance(background_color, np.ndarray):
+            screen.fill(background_color)
+        else:
+            screen.fill([255, 255, 255])
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+
+        process_frame()
+
+        # print(normalized_global_rms)
+        if normalized_global_rms > 0.007:
+            background_color += 0.085 * (255 - background_color)
+        else:
+            background_color = 255.0
+
+        fft_peaks = find_note_peaks(audio_buffer[-fft_window:], fs)
+        expired = []
+        for midi, circle in list(circles_by_midi.items()):
+            if not circle.update(fft_peaks):
+                expired.append(midi)
+        for midi in expired:
+            del circles_by_midi[midi]
+
+        for circle in circles_by_midi.values():
+            circle.draw(screen)
+
+        pygame.display.flip()
+        clock.tick(FPS)
