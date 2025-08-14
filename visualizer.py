@@ -188,62 +188,124 @@ def update_pedal_state(current_level_db, global_db):
 
     # return pedal_state, smoothed_level
 
-def measure_interharmonic_broadband_rms(audio_frame, sr, peaks=None,
-                                        peak_mask_hz=30.0, highband_hz=5000.0,
-                                        print_prefix="PEDAL"):
+def measure_interharmonic_broadband_rms(
+    audio_frame,
+    sr,
+    peaks=None,
+    peak_mask_hz=30.0,
+    highband_hz=5000.0,
+    memory_ms=300.0,
+    print_prefix="PEDAL"
+):
     """
-    Compute & print inter-harmonic (peak-masked) RMS and high-band RMS from a single audio frame.
-    - Causal (uses only the given frame).
-    - Inter-harmonic floor: masks ±peak_mask_hz around detected spectral peaks.
-    - High-band RMS: RMS above highband_hz (e.g., >5 kHz for undamped-string hiss).
+    Drop-in Level-2 version: same output as before, but the inter-harmonic mask includes
+    peaks from the current frame *and* all peaks observed in the last `memory_ms`.
+    No other code changes required.
+
+    - Uses only past data (causal), zero-lookahead.
+    - Keeps a tiny in-function memory of recent peaks as (freq, tstamp).
+    - If `peaks` is provided, it will be merged into the memory; otherwise it calls your
+      existing `find_note_peaks(audio_frame, sr)` without modifying it.
     """
     if audio_frame is None or len(audio_frame) == 0:
         return
 
-    # Window + spectrum
+    # Local imports so you don't have to edit global imports
+    import time
+    import numpy as np
+    from numpy.fft import rfft, rfftfreq
+
+    # Initialize a tiny ring buffer on the function itself (no global changes)
+    if not hasattr(measure_interharmonic_broadband_rms, "_recent_peaks"):
+        from collections import deque
+        # store tuples: (freq_hz, timestamp_seconds)
+        measure_interharmonic_broadband_rms._recent_peaks = deque()
+    recent_peaks = measure_interharmonic_broadband_rms._recent_peaks
+
+    # === FFT ===
     window = np.hanning(len(audio_frame))
     frame = audio_frame * window
     spec = np.abs(rfft(frame))
     freqs = rfftfreq(len(audio_frame), 1.0 / sr)
+
+    # === Global RMS (optional, handy if you want normalization later) ===
     global_rms = float(np.sqrt(np.mean(spec ** 2)))
     global_rms_db = 20.0 * np.log10(global_rms + 1e-12)
 
-    # Get peaks (use existing function if peaks not supplied)
+    # === Current-frame peaks ===
     if peaks is None:
         try:
-            peak_list = find_note_peaks(audio_frame, sr)  # expects list of (freq, mag)
+            peak_list = find_note_peaks(audio_frame, sr)  # expects list of (freq, mag) or (freq, *)
         except Exception:
             peak_list = []
     else:
         peak_list = peaks
 
-    # Build mask for "inter-harmonic" regions (exclude bins near peaks)
+    now = time.time()
+
+    # Append current peaks to memory with timestamps
+    for p in peak_list:
+        try:
+            pf = float(p[0])  # frequency in Hz
+        except Exception:
+            continue
+        recent_peaks.append((pf, now))
+
+    # Prune old peaks outside memory window
+    cutoff = now - (memory_ms / 1000.0)
+    while recent_peaks and recent_peaks[0][1] < cutoff:
+        recent_peaks.popleft()
+
+    # === Build mask for inter-harmonic floor ===
     mask = np.ones_like(spec, dtype=bool)
+    mask &= freqs >= 30.0  # drop DC/infra
 
-    # avoid DC/ultra-low
-    mask &= freqs >= 30.0
-
-    # exclude ±peak_mask_hz around each detected peak frequency
-    for (pf, _pmag) in peak_list:
+    # Mask current-frame peaks (defensive if caller passes peaks but you still want both)
+    for p in peak_list:
+        try:
+            pf = float(p[0])
+        except Exception:
+            continue
         left = pf - peak_mask_hz
         right = pf + peak_mask_hz
         mask &= ~((freqs >= left) & (freqs <= right))
 
-    # Inter-harmonic RMS (masked bins)
+    # Mask all peaks seen in the recent memory window
+    # (this is the Level-2 addition over the original function)
+    for pf, _t in recent_peaks:
+        left = pf - peak_mask_hz
+        right = pf + peak_mask_hz
+        mask &= ~((freqs >= left) & (freqs <= right))
+
+    # === Inter-harmonic RMS (masked bins) ===
     inter_bins = spec[mask]
     inter_rms = float(np.sqrt(np.mean(inter_bins ** 2))) if inter_bins.size else 0.0
 
-    # High-band RMS (e.g., >5 kHz) — broadband cue for undamped strings
+    # === High-band RMS (> highband_hz) ===
     hb_mask = freqs >= highband_hz
     hb_bins = spec[hb_mask]
     highband_rms = float(np.sqrt(np.mean(hb_bins ** 2))) if hb_bins.size else 0.0
 
-    # Print in dB for easy thresholding (relative scale)
+    # === Convert to dB ===
     eps = 1e-12
     inter_db = 20.0 * np.log10(inter_rms + eps)
     highband_db = 20.0 * np.log10(highband_rms + eps)
     update_pedal_state(inter_db, global_rms_db)
-    # print(f"{print_prefix} interharmonic_rms_db={inter_db:.2f}  highband_rms_db={highband_db:.2f}")
+    # Print (same style as before)
+    # print(
+    #     f"{print_prefix} interharmonic_rms_db={inter_db:.2f}  "
+    #     f"highband_rms_db={highband_db:.2f}  "
+    #     f"global_rms_db={global_rms_db:.2f}"
+    # )
+
+    # Optionally return values for downstream use
+    # return {
+    #     "inter_db": inter_db,
+    #     "highband_db": highband_db,
+    #     "global_rms_db": global_rms_db,
+    #     "num_recent_peaks": len(recent_peaks),
+    # }
+
 
 # === CIRCLE ===
 class Circle:
@@ -266,14 +328,14 @@ class Circle:
 
         # Keep radius tied to per-note normalized amp (against that note's last onset amp)
         normalized_note = self.amp / (last_onset_amp_by_midi.get(self.midi, self.amp) + 1e-6)
-        self.r = min(250, float(self.amp) * 5000.0)
+        self.r = min(250, float(self.amp) * 3000.0)
         glob_normalized_note = self.amp / (max_recent + 1e-6)
         if max_recent < 0.01:
             glob_normalized_note = 0.0
         # if self.midi == 69:
         #     print(glob_normalized_note)
         # NEW: bleed on pedal state
-        background_color += 0.007 * pedal_state * (self.color - background_color)
+        background_color += 0.0009 * pedal_state * (self.color - background_color)
 
         return self.r > 1 and self.alpha > 5
 
@@ -363,6 +425,7 @@ with stream:
             peaks=fft_peaks,              # optional; pass None to let the function call find_note_peaks itself
             peak_mask_hz=30.0,            # tweak: 20–40 Hz works well
             highband_hz=5000.0,           # tweak: 5–6 kHz at 22.05 kHz SR
+            memory_ms=300.0,              # Level-2 addition: keep masking peaks seen in last 300 ms
             print_prefix="PEDAL"
         )
         expired = []
