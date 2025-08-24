@@ -6,6 +6,7 @@ import time
 from scipy.signal import find_peaks
 from scipy.fft import rfft, rfftfreq
 from collections import deque
+import math
 
 # === CONFIGURATION ===
 fs = 22050
@@ -30,7 +31,7 @@ alpha = 0.2               # smoothing factor for EMA (~0.2 = ~200 ms smoothing a
 # th_on = -28.0              # dB threshold to turn ON
 # th_off = -32.0             # dB threshold to turn OFF
 # min_time_in_state = 0.15   # seconds to require before switching
-pedal_threshold = -30
+pedal_threshold = -28
 
 # Persistent variables
 pedal_state = 0
@@ -149,6 +150,189 @@ def random_position():
 # Time tracking
 last_switch_time = time.time()
 
+def interharmonic_plot_update(inter_db, *, title="Inter-harmonic RMS (dB)", window_seconds=10.0):
+    """
+    Real-time scrolling plot for inter-harmonic RMS in dB.
+    Call this once per main-loop iteration with your latest 'inter_db' value.
+    - No lookahead, non-blocking (uses interactive mode).
+    - Keeps the last 'window_seconds' of data visible.
+    - Auto-initializes on first call; no separate init required.
+    """
+    import time
+    import numpy as np
+
+    st = interharmonic_plot_update.__dict__
+    now = time.time()
+
+    # Lazy init
+    if "init" not in st:
+        st["init"] = True
+        st["t0"] = now
+        st["times"] = []   # seconds since first call
+        st["vals"] = []    # inter_db values
+
+        # Set up matplotlib (interactive)
+        import matplotlib
+        matplotlib.use("MacOSX")  # fall back to a common interactive backend; change if you prefer
+        import matplotlib.pyplot as plt
+        st["plt"] = plt
+        plt.ion()
+        st["fig"], st["ax"] = plt.subplots(figsize=(9, 3))
+        st["line"], = st["ax"].plot([], [], lw=1.8)
+        st["ax"].set_title(title)
+        st["ax"].set_xlabel("Time (s)")
+        st["ax"].set_ylabel("dB")
+        st["ax"].grid(True, alpha=0.3)
+        st["fig"].canvas.mpl_connect("close_event", lambda ev: st.__setitem__("closed", True))
+        st["closed"] = False
+
+    if st.get("closed"):
+        return  # window was closed by the user; do nothing
+
+    # Append new sample
+    t_rel = now - st["t0"]
+    st["times"].append(t_rel)
+    st["vals"].append(float(inter_db))
+
+    # Drop old samples outside the window
+    t_min = t_rel - float(window_seconds)
+    i0 = 0
+    # Find first index with time >= t_min (linear scan is fine for typical loop rates)
+    while i0 < len(st["times"]) and st["times"][i0] < t_min:
+        i0 += 1
+    if i0 > 0:
+        st["times"] = st["times"][i0:]
+        st["vals"] = st["vals"][i0:]
+
+    # Update plot data
+    st["line"].set_data(st["times"], st["vals"])
+
+    # X limits: keep last window_seconds visible
+    if st["times"]:
+        st["ax"].set_xlim(max(0.0, st["times"][0]), st["times"][-1] if st["times"][-1] > window_seconds else window_seconds)
+    else:
+        st["ax"].set_xlim(0, window_seconds)
+
+    # Y limits: pad around current min/max to avoid cramped view
+    if st["vals"]:
+        vmin = float(np.min(st["vals"]))
+        vmax = float(np.max(st["vals"]))
+        pad = max(1.0, 0.1 * max(1.0, vmax - vmin))
+        st["ax"].set_ylim(vmin - pad, vmax + pad)
+
+    # Draw without blocking your loop
+    st["fig"].canvas.draw_idle()
+    st["fig"].canvas.flush_events()
+
+def update_pedal_state_with_timers(
+    rel_db,
+    pedal_state,
+    *,
+    # Use YOUR real thresholds here (from your code)
+    th_on_db,
+    th_off_db,
+
+    # Time constants (ms)
+    dwell_ms=500,        # need this long continuously beyond threshold to flip
+    gray_hold_ms=500,    # freeze while in gray zone for this long
+    attack_ms=80,        # easing toward ON target
+    release_ms=160,      # easing toward OFF target
+
+    # Smoothing of input metric (set 0.0 to disable)
+    alpha=0.2,
+
+    # IMPORTANT: your float targets (not limited to 0..1)
+    # Set these to what your renderer expects for "no pedal" vs "full pedal"
+    target_on_value=1.0,
+    target_off_value=0.0
+):
+    """
+    Timer/hysteresis pedal updater that returns a FLOAT pedal_state (not clamped to 0..1).
+
+    Inputs:
+      rel_db:      your relative cue in dB
+      pedal_state: your current float pedal_state
+
+    Behavior:
+      - Hysteresis (th_on_db > th_off_db)
+      - Dwell: must remain beyond threshold for dwell_ms to flip internal latch
+      - Gray-hold: if rel_db is in (th_off_db, th_on_db), freeze state for gray_hold_ms
+      - Attack/release easing toward arbitrary float targets you set
+    """
+
+    st = update_pedal_state_with_timers.__dict__
+    now = time.time()
+
+    # --- init persistent state ---
+    if "init" not in st:
+        st["init"] = True
+        # internal discrete latch (0/1), derived from where the current pedal_state is closer
+        st["latched"] = 1 if abs(pedal_state - target_on_value) < abs(pedal_state - target_off_value) else 0
+        st["rel_s"] = float(rel_db)   # smoothed metric
+        st["cand_on_t"] = None
+        st["cand_off_t"] = None
+        st["gray_since"] = None
+        st["prev_t"] = now
+
+    # --- smooth the metric (optional) ---
+    st["rel_s"] = (1 - alpha) * st["rel_s"] + alpha * float(rel_db)
+    x = st["rel_s"]
+
+    # --- gray zone hold ---
+    in_gray = (x > th_off_db) and (x < th_on_db)
+    now = time.time()
+    if in_gray:
+        if st["gray_since"] is None:
+            st["gray_since"] = now
+        gray_hold_active = (now - st["gray_since"]) < (gray_hold_ms / 1000.0)
+    else:
+        st["gray_since"] = None
+        gray_hold_active = False
+
+    # --- dwell‑based latch updates (only if not in active gray hold) ---
+    if not gray_hold_active:
+        # candidate ON
+        if st["latched"] == 0 and x >= th_on_db:
+            st["cand_on_t"] = st["cand_on_t"] or now
+            if (now - st["cand_on_t"]) >= (dwell_ms / 1000.0):
+                st["latched"] = 1
+                st["cand_on_t"] = None
+                st["cand_off_t"] = None
+        else:
+            st["cand_on_t"] = None
+
+        # candidate OFF
+        if st["latched"] == 1 and x <= th_off_db:
+            st["cand_off_t"] = st["cand_off_t"] or now
+            if (now - st["cand_off_t"]) >= (dwell_ms / 1000.0):
+                st["latched"] = 0
+                st["cand_off_t"] = None
+                st["cand_on_t"] = None
+        else:
+            st["cand_off_t"] = None
+
+    # --- ease your FLOAT pedal_state toward targets (not clamped 0..1) ---
+    dt = max(1e-3, now - st["prev_t"])
+    st["prev_t"] = now
+
+    target = target_on_value if st["latched"] == 1 else target_off_value
+    # separate attack/release time constants
+    tau = (attack_ms / 1000.0) if (target - pedal_state) > 0 else (release_ms / 1000.0)
+    k = 1.0 - math.exp(-dt / max(1e-3, tau))
+    new_pedal_state = pedal_state + (target - pedal_state) * k
+
+    # Optional debug if you want to log behavior
+    dbg = {
+        "rel_db_smooth": x,
+        "latched": st["latched"],
+        "in_gray": in_gray,
+        "th_on_db": th_on_db,
+        "th_off_db": th_off_db,
+        "target": target,
+    }
+
+    return new_pedal_state, dbg
+
 def update_pedal_state(current_level_db, global_db):
     global pedal_state, smoothed_level, pedal_threshold
 
@@ -170,8 +354,23 @@ def update_pedal_state(current_level_db, global_db):
     else:
         pedal_state = 0
     
-    print(smoothed_level, global_db)
+    # print(smoothed_level, global_db)
 
+    # pedal_state, dbg = update_pedal_state_with_timers(
+    #     smoothed_level - global_db,
+    #     pedal_state,
+    #     th_on_db= -23,     # <- use the actual values from your code
+    #     th_off_db= -28,   # <- use the actual values from your code
+    #     dwell_ms=500,
+    #     gray_hold_ms=500,
+    #     attack_ms=80,
+    #     release_ms=160,
+    #     target_on_value= 0.001,     # e.g., 1.0, or whatever “full pedal” means in your renderer
+    #     target_off_value= 0    # e.g., 0.0, or your natural “no pedal” background
+    # )
+    print(current_level_db)
+    interharmonic_plot_update(current_level_db)
+    
     # State machine with hysteresis
     # if not pedal_state:
     #     # Currently OFF, check if we should turn ON
@@ -438,5 +637,5 @@ with stream:
         for circle in circles_by_midi.values():
             circle.draw(screen)
 
-        pygame.display.flip()
+        # pygame.display.flip()
         clock.tick(FPS)
