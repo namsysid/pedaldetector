@@ -34,7 +34,7 @@ alpha = 0.2               # smoothing factor for EMA (~0.2 = ~200 ms smoothing a
 pedal_threshold = -28
 
 # Persistent variables
-pedal_state = 0
+pedal_state = False
 smoothed_level = None
 
 # === STATE ===
@@ -49,6 +49,10 @@ last_onset_amp_by_midi = {}
 last_onset_rms = 1e-6
 background_color = np.array([255, 255, 255], dtype=np.float32)
 last_loudest_time = 0
+PEDAL_HYST_ON_DB   = -30.0
+PEDAL_HYST_ON_DUR  = 4.0    # seconds
+PEDAL_HYST_OFF_DUR = 0.050  # seconds
+interharmonic_rms = 0.0
 
 # === INIT PYGAME ===
 pygame.init()
@@ -334,58 +338,57 @@ def update_pedal_state_with_timers(
     return new_pedal_state, dbg
 
 def update_pedal_state(current_level_db, global_db):
-    global pedal_state, smoothed_level, pedal_threshold
+    """
+    Update the global pedal_state using hysteresis with dwell timers.
 
-    now = time.time()
+    Rules:
+      • Start with pedal OFF (False / 0.0).
+      • If inter-harmonic RMS in dB stays > PEDAL_HYST_ON_DB for PEDAL_HYST_ON_DUR seconds, set pedal True.
+      • If pedal is True and inter-harmonic RMS in dB stays <= PEDAL_HYST_ON_DB for PEDAL_HYST_OFF_DUR seconds, set pedal False.
+    """
+    global pedal_state
 
-    # Initialize smoother
-    if smoothed_level is None:
-        smoothed_level = current_level_db
+    # Plot for debugging (non-blocking)
+    try:
+        interharmonic_plot_update(current_level_db)
+    except Exception:
+        pass
 
-    # Exponential moving average smoothing
-    smoothed_level = (1 - alpha) * smoothed_level + alpha * current_level_db
-    relative_level = smoothed_level - global_db
-    if (global_db < -26):
-        relative_level = global_db - 26
-    # if smoothed_level > -40:
-    #     print(relative_level)
-    if smoothed_level > -35:
-        pedal_state = max(0, relative_level - pedal_threshold)
+    now = time.monotonic()
+    st = update_pedal_state.__dict__
+
+    if "state" not in st:
+        st["state"] = False  # default OFF
+        st["on_start"] = None
+        st["off_start"] = None
+
+    above = current_level_db > PEDAL_HYST_ON_DB
+
+    if not st["state"]:
+        # Currently OFF → consider turning ON
+        if above:
+            if st["on_start"] is None:
+                st["on_start"] = now
+            if (now - st["on_start"]) >= PEDAL_HYST_ON_DUR:
+                st["state"] = True
+                st["off_start"] = None
+        else:
+            st["on_start"] = None
     else:
-        pedal_state = 0
-    
-    # print(smoothed_level, global_db)
+        # Currently ON → consider turning OFF
+        if not above:  # ≤ threshold
+            if st["off_start"] is None:
+                st["off_start"] = now
+            if (now - st["off_start"]) >= PEDAL_HYST_OFF_DUR:
+                st["state"] = False
+                st["on_start"] = None
+        else:
+            st["off_start"] = None
 
-    # pedal_state, dbg = update_pedal_state_with_timers(
-    #     smoothed_level - global_db,
-    #     pedal_state,
-    #     th_on_db= -23,     # <- use the actual values from your code
-    #     th_off_db= -28,   # <- use the actual values from your code
-    #     dwell_ms=500,
-    #     gray_hold_ms=500,
-    #     attack_ms=80,
-    #     release_ms=160,
-    #     target_on_value= 0.001,     # e.g., 1.0, or whatever “full pedal” means in your renderer
-    #     target_off_value= 0    # e.g., 0.0, or your natural “no pedal” background
-    # )
-    print(current_level_db)
-    interharmonic_plot_update(current_level_db)
-    
-    # State machine with hysteresis
-    # if not pedal_state:
-    #     # Currently OFF, check if we should turn ON
-    #     if smoothed_level > th_on and (now - last_switch_time) > min_time_in_state:
-    #         pedal_state = True
-    #         last_switch_time = now
-    #         print("PEDAL: ON")
-    # else:
-    #     # Currently ON, check if we should turn OFF
-    #     if smoothed_level < th_off and (now - last_switch_time) > min_time_in_state:
-    #         pedal_state = False
-    #         last_switch_time = now
-    #         print("PEDAL: OFF")
-
-    # return pedal_state, smoothed_level
+    # Expose as float for rest of pipeline
+    pedal_state = 1.0 if st["state"] else 0.0
+    print(pedal_state)
+    return pedal_state
 
 def measure_interharmonic_broadband_rms(
     audio_frame,
@@ -413,6 +416,8 @@ def measure_interharmonic_broadband_rms(
     import time
     import numpy as np
     from numpy.fft import rfft, rfftfreq
+
+    global interharmonic_rms
 
     # Initialize a tiny ring buffer on the function itself (no global changes)
     if not hasattr(measure_interharmonic_broadband_rms, "_recent_peaks"):
@@ -489,6 +494,7 @@ def measure_interharmonic_broadband_rms(
     eps = 1e-12
     inter_db = 20.0 * np.log10(inter_rms + eps)
     highband_db = 20.0 * np.log10(highband_rms + eps)
+    interharmonic_rms = inter_db
     update_pedal_state(inter_db, global_rms_db)
     # Print (same style as before)
     # print(
@@ -520,7 +526,7 @@ class Circle:
         self.decay = 1
 
     def update(self, fft_peaks):
-        global background_color, normalized_global_rms, max_recent, pedal_state
+        global background_color, normalized_global_rms, max_recent, pedal_state, interharmonic_rms
 
         # Track live amp for this MIDI (fallback slight decay)
         self.amp = next((amp for freq, amp in fft_peaks if freq_to_midi(freq) == self.midi), self.amp * 0.98)
@@ -534,7 +540,8 @@ class Circle:
         # if self.midi == 69:
         #     print(glob_normalized_note)
         # NEW: bleed on pedal state
-        background_color += 0.0009 * pedal_state * (self.color - background_color)
+        if pedal_state:
+            background_color += 0.00000009 * (interharmonic_rms + 35.0) * (self.color - background_color)
 
         return self.r > 1 and self.alpha > 5
 
