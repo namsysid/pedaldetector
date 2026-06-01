@@ -50,8 +50,8 @@ last_onset_rms = 1e-6
 background_color = np.array([255, 255, 255], dtype=np.float32)
 last_loudest_time = 0
 PEDAL_HYST_ON_DB   = -30.0
-PEDAL_HYST_ON_DUR  = 4.0    # seconds
-PEDAL_HYST_OFF_DUR = 0.050  # seconds
+PEDAL_HYST_ON_DUR  = 2.0    # seconds
+PEDAL_HYST_OFF_DUR = 0.01  # seconds
 interharmonic_rms = 0.0
 
 # === INIT PYGAME ===
@@ -473,6 +473,14 @@ def measure_interharmonic_broadband_rms(
         left = pf - peak_mask_hz
         right = pf + peak_mask_hz
         mask &= ~((freqs >= left) & (freqs <= right))
+        # NEW: also mask a few integer multiples of each peak (2x..4x)
+        for k in range(2, 5):
+                fk = k * pf
+                if fk >= highband_hz:
+                    break
+                left_k = fk - peak_mask_hz
+                right_k = fk + peak_mask_hz
+                mask &= ~((freqs >= left_k) & (freqs <= right_k))
 
     # Mask all peaks seen in the recent memory window
     # (this is the Level-2 addition over the original function)
@@ -480,6 +488,14 @@ def measure_interharmonic_broadband_rms(
         left = pf - peak_mask_hz
         right = pf + peak_mask_hz
         mask &= ~((freqs >= left) & (freqs <= right))
+        # NEW: also mask integer multiples for recent peaks
+        for k in range(2, 5):
+            fk = k * pf
+            if fk >= highband_hz:
+                break
+            left_k = fk - peak_mask_hz
+            right_k = fk + peak_mask_hz
+            mask &= ~((freqs >= left_k) & (freqs <= right_k))
 
     # === Inter-harmonic RMS (masked bins) ===
     inter_bins = spec[mask]
@@ -540,8 +556,8 @@ class Circle:
         # if self.midi == 69:
         #     print(glob_normalized_note)
         # NEW: bleed on pedal state
-        if pedal_state:
-            background_color += 0.00000009 * (interharmonic_rms + 35.0) * (self.color - background_color)
+        # print(pedal_state * 0.0009 * (self.color - background_color))
+        background_color += pedal_state * 0.009 * (self.color - background_color)
 
         return self.r > 1 and self.alpha > 5
 
@@ -622,7 +638,8 @@ with stream:
         if normalized_global_rms > 0.007:
             background_color += 0.085 * (255 - background_color)
         else:
-            background_color = 255.0
+            # Keep type consistent: always an ndarray to avoid type errors in Circle.update
+            background_color = np.array([255.0, 255.0, 255.0], dtype=np.float32)
 
         fft_peaks = find_note_peaks(audio_buffer[-fft_window:], fs)
         measure_interharmonic_broadband_rms(
@@ -644,5 +661,5 @@ with stream:
         for circle in circles_by_midi.values():
             circle.draw(screen)
 
-        # pygame.display.flip()
+        pygame.display.flip()
         clock.tick(FPS)
