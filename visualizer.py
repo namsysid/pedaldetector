@@ -6,6 +6,7 @@ import time
 from scipy.signal import find_peaks
 from scipy.fft import rfft, rfftfreq
 from collections import deque
+import math
 
 # === CONFIGURATION ===
 fs = 22050
@@ -25,6 +26,16 @@ GLOBAL_RMS_BLEED_THRESH = 0.25            # NEW: threshold on normalized global 
 buffer_samples = int(BUFFER_SECONDS * fs)
 onset_window = int(0.5 * fs)
 loudest_note_interval = 0.1  # seconds
+bleed_rate = 0.007
+alpha = 0.2               # smoothing factor for EMA (~0.2 = ~200 ms smoothing at 25 Hz updates)
+# th_on = -28.0              # dB threshold to turn ON
+# th_off = -32.0             # dB threshold to turn OFF
+# min_time_in_state = 0.15   # seconds to require before switching
+pedal_threshold = -28
+
+# Persistent variables
+pedal_state = False
+smoothed_level = None
 
 # === STATE ===
 recent_global_rms = deque(maxlen=int(GLOBAL_RMS_WINDOW_SEC / frame_duration))
@@ -38,6 +49,10 @@ last_onset_amp_by_midi = {}
 last_onset_rms = 1e-6
 background_color = np.array([255, 255, 255], dtype=np.float32)
 last_loudest_time = 0
+PEDAL_HYST_ON_DB   = -30.0
+PEDAL_HYST_ON_DUR  = 2.0    # seconds
+PEDAL_HYST_OFF_DUR = 0.01  # seconds
+interharmonic_rms = 0.0
 
 # === INIT PYGAME ===
 pygame.init()
@@ -136,6 +151,383 @@ def random_color():
 def random_position():
     return random.randint(0, WIDTH), random.randint(0, HEIGHT)
 
+# Time tracking
+last_switch_time = time.time()
+
+def interharmonic_plot_update(inter_db, *, title="Inter-harmonic RMS (dB)", window_seconds=10.0):
+    """
+    Real-time scrolling plot for inter-harmonic RMS in dB.
+    Call this once per main-loop iteration with your latest 'inter_db' value.
+    - No lookahead, non-blocking (uses interactive mode).
+    - Keeps the last 'window_seconds' of data visible.
+    - Auto-initializes on first call; no separate init required.
+    """
+    import time
+    import numpy as np
+
+    st = interharmonic_plot_update.__dict__
+    now = time.time()
+
+    # Lazy init
+    if "init" not in st:
+        st["init"] = True
+        st["t0"] = now
+        st["times"] = []   # seconds since first call
+        st["vals"] = []    # inter_db values
+
+        # Set up matplotlib (interactive)
+        import matplotlib
+        matplotlib.use("MacOSX")  # fall back to a common interactive backend; change if you prefer
+        import matplotlib.pyplot as plt
+        st["plt"] = plt
+        plt.ion()
+        st["fig"], st["ax"] = plt.subplots(figsize=(9, 3))
+        st["line"], = st["ax"].plot([], [], lw=1.8)
+        st["ax"].set_title(title)
+        st["ax"].set_xlabel("Time (s)")
+        st["ax"].set_ylabel("dB")
+        st["ax"].grid(True, alpha=0.3)
+        st["fig"].canvas.mpl_connect("close_event", lambda ev: st.__setitem__("closed", True))
+        st["closed"] = False
+
+    if st.get("closed"):
+        return  # window was closed by the user; do nothing
+
+    # Append new sample
+    t_rel = now - st["t0"]
+    st["times"].append(t_rel)
+    st["vals"].append(float(inter_db))
+
+    # Drop old samples outside the window
+    t_min = t_rel - float(window_seconds)
+    i0 = 0
+    # Find first index with time >= t_min (linear scan is fine for typical loop rates)
+    while i0 < len(st["times"]) and st["times"][i0] < t_min:
+        i0 += 1
+    if i0 > 0:
+        st["times"] = st["times"][i0:]
+        st["vals"] = st["vals"][i0:]
+
+    # Update plot data
+    st["line"].set_data(st["times"], st["vals"])
+
+    # X limits: keep last window_seconds visible
+    if st["times"]:
+        st["ax"].set_xlim(max(0.0, st["times"][0]), st["times"][-1] if st["times"][-1] > window_seconds else window_seconds)
+    else:
+        st["ax"].set_xlim(0, window_seconds)
+
+    # Y limits: pad around current min/max to avoid cramped view
+    if st["vals"]:
+        vmin = float(np.min(st["vals"]))
+        vmax = float(np.max(st["vals"]))
+        pad = max(1.0, 0.1 * max(1.0, vmax - vmin))
+        st["ax"].set_ylim(vmin - pad, vmax + pad)
+
+    # Draw without blocking your loop
+    st["fig"].canvas.draw_idle()
+    st["fig"].canvas.flush_events()
+
+def update_pedal_state_with_timers(
+    rel_db,
+    pedal_state,
+    *,
+    # Use YOUR real thresholds here (from your code)
+    th_on_db,
+    th_off_db,
+
+    # Time constants (ms)
+    dwell_ms=500,        # need this long continuously beyond threshold to flip
+    gray_hold_ms=500,    # freeze while in gray zone for this long
+    attack_ms=80,        # easing toward ON target
+    release_ms=160,      # easing toward OFF target
+
+    # Smoothing of input metric (set 0.0 to disable)
+    alpha=0.2,
+
+    # IMPORTANT: your float targets (not limited to 0..1)
+    # Set these to what your renderer expects for "no pedal" vs "full pedal"
+    target_on_value=1.0,
+    target_off_value=0.0
+):
+    """
+    Timer/hysteresis pedal updater that returns a FLOAT pedal_state (not clamped to 0..1).
+
+    Inputs:
+      rel_db:      your relative cue in dB
+      pedal_state: your current float pedal_state
+
+    Behavior:
+      - Hysteresis (th_on_db > th_off_db)
+      - Dwell: must remain beyond threshold for dwell_ms to flip internal latch
+      - Gray-hold: if rel_db is in (th_off_db, th_on_db), freeze state for gray_hold_ms
+      - Attack/release easing toward arbitrary float targets you set
+    """
+
+    st = update_pedal_state_with_timers.__dict__
+    now = time.time()
+
+    # --- init persistent state ---
+    if "init" not in st:
+        st["init"] = True
+        # internal discrete latch (0/1), derived from where the current pedal_state is closer
+        st["latched"] = 1 if abs(pedal_state - target_on_value) < abs(pedal_state - target_off_value) else 0
+        st["rel_s"] = float(rel_db)   # smoothed metric
+        st["cand_on_t"] = None
+        st["cand_off_t"] = None
+        st["gray_since"] = None
+        st["prev_t"] = now
+
+    # --- smooth the metric (optional) ---
+    st["rel_s"] = (1 - alpha) * st["rel_s"] + alpha * float(rel_db)
+    x = st["rel_s"]
+
+    # --- gray zone hold ---
+    in_gray = (x > th_off_db) and (x < th_on_db)
+    now = time.time()
+    if in_gray:
+        if st["gray_since"] is None:
+            st["gray_since"] = now
+        gray_hold_active = (now - st["gray_since"]) < (gray_hold_ms / 1000.0)
+    else:
+        st["gray_since"] = None
+        gray_hold_active = False
+
+    # --- dwell‑based latch updates (only if not in active gray hold) ---
+    if not gray_hold_active:
+        # candidate ON
+        if st["latched"] == 0 and x >= th_on_db:
+            st["cand_on_t"] = st["cand_on_t"] or now
+            if (now - st["cand_on_t"]) >= (dwell_ms / 1000.0):
+                st["latched"] = 1
+                st["cand_on_t"] = None
+                st["cand_off_t"] = None
+        else:
+            st["cand_on_t"] = None
+
+        # candidate OFF
+        if st["latched"] == 1 and x <= th_off_db:
+            st["cand_off_t"] = st["cand_off_t"] or now
+            if (now - st["cand_off_t"]) >= (dwell_ms / 1000.0):
+                st["latched"] = 0
+                st["cand_off_t"] = None
+                st["cand_on_t"] = None
+        else:
+            st["cand_off_t"] = None
+
+    # --- ease your FLOAT pedal_state toward targets (not clamped 0..1) ---
+    dt = max(1e-3, now - st["prev_t"])
+    st["prev_t"] = now
+
+    target = target_on_value if st["latched"] == 1 else target_off_value
+    # separate attack/release time constants
+    tau = (attack_ms / 1000.0) if (target - pedal_state) > 0 else (release_ms / 1000.0)
+    k = 1.0 - math.exp(-dt / max(1e-3, tau))
+    new_pedal_state = pedal_state + (target - pedal_state) * k
+
+    # Optional debug if you want to log behavior
+    dbg = {
+        "rel_db_smooth": x,
+        "latched": st["latched"],
+        "in_gray": in_gray,
+        "th_on_db": th_on_db,
+        "th_off_db": th_off_db,
+        "target": target,
+    }
+
+    return new_pedal_state, dbg
+
+def update_pedal_state(current_level_db, global_db):
+    """
+    Update the global pedal_state using hysteresis with dwell timers.
+
+    Rules:
+      • Start with pedal OFF (False / 0.0).
+      • If inter-harmonic RMS in dB stays > PEDAL_HYST_ON_DB for PEDAL_HYST_ON_DUR seconds, set pedal True.
+      • If pedal is True and inter-harmonic RMS in dB stays <= PEDAL_HYST_ON_DB for PEDAL_HYST_OFF_DUR seconds, set pedal False.
+    """
+    global pedal_state
+
+    # Plot for debugging (non-blocking)
+    try:
+        interharmonic_plot_update(current_level_db)
+    except Exception:
+        pass
+
+    now = time.monotonic()
+    st = update_pedal_state.__dict__
+
+    if "state" not in st:
+        st["state"] = False  # default OFF
+        st["on_start"] = None
+        st["off_start"] = None
+
+    above = current_level_db > PEDAL_HYST_ON_DB
+
+    if not st["state"]:
+        # Currently OFF → consider turning ON
+        if above:
+            if st["on_start"] is None:
+                st["on_start"] = now
+            if (now - st["on_start"]) >= PEDAL_HYST_ON_DUR:
+                st["state"] = True
+                st["off_start"] = None
+        else:
+            st["on_start"] = None
+    else:
+        # Currently ON → consider turning OFF
+        if not above:  # ≤ threshold
+            if st["off_start"] is None:
+                st["off_start"] = now
+            if (now - st["off_start"]) >= PEDAL_HYST_OFF_DUR:
+                st["state"] = False
+                st["on_start"] = None
+        else:
+            st["off_start"] = None
+
+    # Expose as float for rest of pipeline
+    pedal_state = 1.0 if st["state"] else 0.0
+    print(pedal_state)
+    return pedal_state
+
+def measure_interharmonic_broadband_rms(
+    audio_frame,
+    sr,
+    peaks=None,
+    peak_mask_hz=30.0,
+    highband_hz=5000.0,
+    memory_ms=300.0,
+    print_prefix="PEDAL"
+):
+    """
+    Drop-in Level-2 version: same output as before, but the inter-harmonic mask includes
+    peaks from the current frame *and* all peaks observed in the last `memory_ms`.
+    No other code changes required.
+
+    - Uses only past data (causal), zero-lookahead.
+    - Keeps a tiny in-function memory of recent peaks as (freq, tstamp).
+    - If `peaks` is provided, it will be merged into the memory; otherwise it calls your
+      existing `find_note_peaks(audio_frame, sr)` without modifying it.
+    """
+    if audio_frame is None or len(audio_frame) == 0:
+        return
+
+    # Local imports so you don't have to edit global imports
+    import time
+    import numpy as np
+    from numpy.fft import rfft, rfftfreq
+
+    global interharmonic_rms
+
+    # Initialize a tiny ring buffer on the function itself (no global changes)
+    if not hasattr(measure_interharmonic_broadband_rms, "_recent_peaks"):
+        from collections import deque
+        # store tuples: (freq_hz, timestamp_seconds)
+        measure_interharmonic_broadband_rms._recent_peaks = deque()
+    recent_peaks = measure_interharmonic_broadband_rms._recent_peaks
+
+    # === FFT ===
+    window = np.hanning(len(audio_frame))
+    frame = audio_frame * window
+    spec = np.abs(rfft(frame))
+    freqs = rfftfreq(len(audio_frame), 1.0 / sr)
+
+    # === Global RMS (optional, handy if you want normalization later) ===
+    global_rms = float(np.sqrt(np.mean(spec ** 2)))
+    global_rms_db = 20.0 * np.log10(global_rms + 1e-12)
+
+    # === Current-frame peaks ===
+    if peaks is None:
+        try:
+            peak_list = find_note_peaks(audio_frame, sr)  # expects list of (freq, mag) or (freq, *)
+        except Exception:
+            peak_list = []
+    else:
+        peak_list = peaks
+
+    now = time.time()
+
+    # Append current peaks to memory with timestamps
+    for p in peak_list:
+        try:
+            pf = float(p[0])  # frequency in Hz
+        except Exception:
+            continue
+        recent_peaks.append((pf, now))
+
+    # Prune old peaks outside memory window
+    cutoff = now - (memory_ms / 1000.0)
+    while recent_peaks and recent_peaks[0][1] < cutoff:
+        recent_peaks.popleft()
+
+    # === Build mask for inter-harmonic floor ===
+    mask = np.ones_like(spec, dtype=bool)
+    mask &= freqs >= 30.0  # drop DC/infra
+
+    # Mask current-frame peaks (defensive if caller passes peaks but you still want both)
+    for p in peak_list:
+        try:
+            pf = float(p[0])
+        except Exception:
+            continue
+        left = pf - peak_mask_hz
+        right = pf + peak_mask_hz
+        mask &= ~((freqs >= left) & (freqs <= right))
+        # NEW: also mask a few integer multiples of each peak (2x..4x)
+        for k in range(2, 5):
+                fk = k * pf
+                if fk >= highband_hz:
+                    break
+                left_k = fk - peak_mask_hz
+                right_k = fk + peak_mask_hz
+                mask &= ~((freqs >= left_k) & (freqs <= right_k))
+
+    # Mask all peaks seen in the recent memory window
+    # (this is the Level-2 addition over the original function)
+    for pf, _t in recent_peaks:
+        left = pf - peak_mask_hz
+        right = pf + peak_mask_hz
+        mask &= ~((freqs >= left) & (freqs <= right))
+        # NEW: also mask integer multiples for recent peaks
+        for k in range(2, 5):
+            fk = k * pf
+            if fk >= highband_hz:
+                break
+            left_k = fk - peak_mask_hz
+            right_k = fk + peak_mask_hz
+            mask &= ~((freqs >= left_k) & (freqs <= right_k))
+
+    # === Inter-harmonic RMS (masked bins) ===
+    inter_bins = spec[mask]
+    inter_rms = float(np.sqrt(np.mean(inter_bins ** 2))) if inter_bins.size else 0.0
+
+    # === High-band RMS (> highband_hz) ===
+    hb_mask = freqs >= highband_hz
+    hb_bins = spec[hb_mask]
+    highband_rms = float(np.sqrt(np.mean(hb_bins ** 2))) if hb_bins.size else 0.0
+
+    # === Convert to dB ===
+    eps = 1e-12
+    inter_db = 20.0 * np.log10(inter_rms + eps)
+    highband_db = 20.0 * np.log10(highband_rms + eps)
+    interharmonic_rms = inter_db
+    update_pedal_state(inter_db, global_rms_db)
+    # Print (same style as before)
+    # print(
+    #     f"{print_prefix} interharmonic_rms_db={inter_db:.2f}  "
+    #     f"highband_rms_db={highband_db:.2f}  "
+    #     f"global_rms_db={global_rms_db:.2f}"
+    # )
+
+    # Optionally return values for downstream use
+    # return {
+    #     "inter_db": inter_db,
+    #     "highband_db": highband_db,
+    #     "global_rms_db": global_rms_db,
+    #     "num_recent_peaks": len(recent_peaks),
+    # }
+
+
 # === CIRCLE ===
 class Circle:
     def __init__(self, x, y, r, color, freq, amp, midi):
@@ -150,22 +542,22 @@ class Circle:
         self.decay = 1
 
     def update(self, fft_peaks):
-        global background_color, normalized_global_rms, max_recent
+        global background_color, normalized_global_rms, max_recent, pedal_state, interharmonic_rms
 
         # Track live amp for this MIDI (fallback slight decay)
         self.amp = next((amp for freq, amp in fft_peaks if freq_to_midi(freq) == self.midi), self.amp * 0.98)
 
         # Keep radius tied to per-note normalized amp (against that note's last onset amp)
         normalized_note = self.amp / (last_onset_amp_by_midi.get(self.midi, self.amp) + 1e-6)
-        self.r = min(250, float(self.amp) * 5000.0)
+        self.r = min(250, float(self.amp) * 3000.0)
         glob_normalized_note = self.amp / (max_recent + 1e-6)
         if max_recent < 0.01:
             glob_normalized_note = 0.0
-        if self.midi == 69:
-            print(glob_normalized_note)
-        # NEW: bleed based ONLY on global normalized RMS vs threshold
-        if glob_normalized_note >= 0.001 and glob_normalized_note < 0.2:
-            background_color += 0.007 * (self.color - background_color)
+        # if self.midi == 69:
+        #     print(glob_normalized_note)
+        # NEW: bleed on pedal state
+        # print(pedal_state * 0.0009 * (self.color - background_color))
+        background_color += pedal_state * 0.009 * (self.color - background_color)
 
         return self.r > 1 and self.alpha > 5
 
@@ -246,9 +638,19 @@ with stream:
         if normalized_global_rms > 0.007:
             background_color += 0.085 * (255 - background_color)
         else:
-            background_color = 255.0
+            # Keep type consistent: always an ndarray to avoid type errors in Circle.update
+            background_color = np.array([255.0, 255.0, 255.0], dtype=np.float32)
 
         fft_peaks = find_note_peaks(audio_buffer[-fft_window:], fs)
+        measure_interharmonic_broadband_rms(
+            audio_frame=audio_buffer[-fft_window:], 
+            sr=fs, 
+            peaks=fft_peaks,              # optional; pass None to let the function call find_note_peaks itself
+            peak_mask_hz=30.0,            # tweak: 20–40 Hz works well
+            highband_hz=5000.0,           # tweak: 5–6 kHz at 22.05 kHz SR
+            memory_ms=300.0,              # Level-2 addition: keep masking peaks seen in last 300 ms
+            print_prefix="PEDAL"
+        )
         expired = []
         for midi, circle in list(circles_by_midi.items()):
             if not circle.update(fft_peaks):
