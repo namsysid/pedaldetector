@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Pedal Detector</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  </head>
+  <body>
+    <main class="shell">
+      <section class="visualizer">
+        <canvas id="visualizer"></canvas>
+        <div class="status-bar">
+          <button id="startButton" type="button">Start Mic</button>
+          <button id="stopButton" type="button" disabled>Stop</button>
+          <div class="meter">
+            <span class="label">Pedal</span>
+            <span id="pedalState" class="pill">Off</span>
+          </div>
+          <div class="metric">
+            <span>Inter dB</span>
+            <strong id="interDb">--</strong>
+          </div>
+          <div class="metric">
+            <span>RMS</span>
+            <strong id="rms">--</strong>
+          </div>
+          <div id="connectionState" class="connection">Idle</div>
+        </div>
+      </section>
+    </main>
+    <script src="{{ url_for('static', filename='app.js') }}" type="module"></script>
+  </body>
+</html>
